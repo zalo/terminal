@@ -8,6 +8,7 @@ A mobile-first web terminal application with tmux-backed session persistence. Bu
 - **Session Persistence**: tmux sessions survive disconnects - reconnect anytime
 - **Multi-Session**: Create and switch between named sessions
 - **File Browser**: Browse and view files (read-only) with syntax highlighting
+- **VNC Desktop**: Browser-based remote desktop access to the server's Wayland/X11 session
 - **Mobile Controls**: Touch-friendly control bar with modifier keys (Ctrl, Alt, Shift), arrows, Tab, Esc, and Paste
 - **Dark Mode**: Polished dark theme optimized for mobile
 
@@ -24,10 +25,32 @@ Node.js Server (Express + node-pty)
 tmux sessions
 ```
 
+### VNC Desktop Architecture
+
+```
+Browser (noVNC)
+    |
+    | WebSocket (WSS)
+    v
+Cloudflare Tunnel (vnc.example.com)
+    |
+    v
+noVNC Proxy (port 6901)
+    |
+    | TCP
+    v
+wayvnc (port 5900)
+    |
+    v
+Wayland Compositor (labwc) + Xwayland
+```
+
 ## Prerequisites
 
 - Node.js 18+
 - tmux
+- wayvnc (for VNC desktop feature)
+- novnc (for VNC web interface)
 - A dedicated user for running terminal sessions (optional but recommended)
 
 ## Installation
@@ -137,13 +160,36 @@ sudo setfacl -R -m u:terminal:rwx /path/to/workspace
 sudo setfacl -R -d -m u:terminal:rwx /path/to/workspace
 ```
 
+### VNC Desktop Setup
+
+The VNC tab provides browser-based access to the server's actual desktop. See [VNC.md](VNC.md) for detailed setup instructions.
+
+**Quick setup:**
+```bash
+# Run the automated setup script (requires root)
+sudo ./setup-vnc.sh
+
+# Configure VNC URL in terminal server
+# Add to /etc/systemd/system/terminal-server.service:
+Environment=VNC_URL=https://vnc.yourdomain.com
+
+# Restart terminal server
+sudo systemctl restart terminal-server
+```
+
+**Requirements:**
+- Wayland compositor (tested with labwc)
+- wayvnc package
+- Cloudflare Tunnel (or similar) for HTTPS/WebSocket routing
+
 ## Usage
 
 1. Open `http://localhost:3000` (or your deployed URL)
 2. Create a new session or select an existing one
 3. Use the terminal as normal
 4. Switch to Files tab to browse and view files
-5. Sessions persist - close the browser and reconnect anytime
+5. Switch to VNC tab to access the server's desktop remotely
+6. Sessions persist - close the browser and reconnect anytime
 
 ### Mobile Controls
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=noVNC Web Terminal Bridge
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /tmp/start-vnc-novnc.sh
+ExecStop=/bin/bash -c 'pkill -f "wayvnc"; pkill -f "node.*novnc-server"'
+User=buddas
+WorkingDirectory=/tmp
+
+[Install]
+WantedBy=multi-user.target

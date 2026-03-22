@@ -48,17 +48,15 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 
-/* Inner terminal container */
+/* Inner terminal container - sizes to fit terminal content */
 .terminal-inner {
   width: 100%;
-  min-height: 100%;
   background-color: var(--color-charcoal);
 }
 
-/* xterm customization */
+/* xterm customization - no fixed height to allow dynamic resizing */
 .xterm {
   padding: 8px;
-  height: 100%;
   width: 100%;
 }
 
