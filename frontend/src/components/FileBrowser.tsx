@@ -14,11 +14,11 @@ interface DirectoryListing {
   files: FileEntry[];
 }
 
-const STORAGE_KEY = 'fileBrowser_lastDir';
-
 interface FileBrowserProps {
   /** Current working directory of the Claude Code session — when it changes, auto-navigate. */
   sessionCwd?: string;
+  /** Context name (work / john / untrusted / tom / admin). Omitted = admin. */
+  context?: string;
 }
 
 function formatSize(bytes: number): string {
@@ -31,7 +31,12 @@ function formatSize(bytes: number): string {
 
 type CreateMode = null | 'file' | 'folder';
 
-export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
+export default function FileBrowser({ sessionCwd, context }: FileBrowserProps = {}) {
+  const STORAGE_KEY = `fileBrowser_lastDir_${context || 'admin'}`;
+  const withCtx = (url: string): string =>
+    context ? `${url}${url.includes('?') ? '&' : '?'}context=${encodeURIComponent(context)}` : url;
+  const ctxBody = (extra: Record<string, unknown>): Record<string, unknown> =>
+    context ? { ...extra, context } : extra;
   const [currentPath, setCurrentPath] = useState('');
   const [listing, setListing] = useState<DirectoryListing | null>(null);
   // Track the last sessionCwd we auto-navigated to so we only re-navigate when it changes,
@@ -39,8 +44,19 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
   const lastSyncedCwdRef = useRef<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [viewingFile, setViewingFile] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
+  const [viewingFile, setViewingFile] = useState<{ path: string; size: number | null } | null>(null);
+  type UploadStatus = 'queued' | 'uploading' | 'done' | 'error' | 'canceled';
+  interface UploadEntry {
+    name: string;
+    total: number;
+    loaded: number;
+    status: UploadStatus;
+    error?: string;
+  }
+  const [uploads, setUploads] = useState<UploadEntry[]>([]);
+  const uploading = uploads.some((u) => u.status === 'queued' || u.status === 'uploading');
+  const uploadXhrRef = useRef<XMLHttpRequest | null>(null);
+  const uploadCanceledRef = useRef(false);
   const [downloading, setDownloading] = useState(false);
   const [dirSizes, setDirSizes] = useState<Record<string, number>>({});
   const [createMode, setCreateMode] = useState<CreateMode>(null);
@@ -59,7 +75,7 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
 
     let cancelled = false;
     setDirSizes({});
-    fetch(`/api/files/dir-sizes?path=${encodeURIComponent(currentPath)}`)
+    fetch(withCtx(`/api/files/dir-sizes?path=${encodeURIComponent(currentPath)}`))
       .then(r => r.json())
       .then(data => { if (!cancelled) setDirSizes(data.sizes || {}); })
       .catch(() => {});
@@ -70,7 +86,7 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+      const res = await fetch(withCtx(`/api/files?path=${encodeURIComponent(path)}`));
       if (res.ok) {
         const data = await res.json();
         setListing(data);
@@ -98,13 +114,13 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     if (saved) {
       fetchDirectory(saved).then(() => {});
     } else {
-      fetch('/api/config')
+      fetch(withCtx('/api/config'))
         .then(r => r.json())
         .then(cfg => fetchDirectory(cfg.rootPath || '/'))
         .catch(() => fetchDirectory('/'));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [context]);
 
   // Follow the agent: when session cwd changes server-side, jump to it.
   useEffect(() => {
@@ -118,7 +134,7 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
   // If the saved path fails, fall back to root
   useEffect(() => {
     if (error && currentPath === '' && listing === null) {
-      fetch('/api/config')
+      fetch(withCtx('/api/config'))
         .then(r => r.json())
         .then(cfg => fetchDirectory(cfg.rootPath || '/'))
         .catch(() => fetchDirectory('/'));
@@ -129,7 +145,7 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     if (entry.type === 'directory') {
       fetchDirectory(`${currentPath}/${entry.name}`);
     } else {
-      setViewingFile(`${currentPath}/${entry.name}`);
+      setViewingFile({ path: `${currentPath}/${entry.name}`, size: entry.size });
     }
   };
 
@@ -139,41 +155,116 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     }
   };
 
+  const uploadOne = useCallback((file: File, index: number, targetPath: string): Promise<void> => {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      uploadXhrRef.current = xhr;
+
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) return;
+        setUploads((prev) =>
+          prev.map((p, idx) =>
+            idx === index ? { ...p, status: 'uploading', loaded: ev.loaded } : p,
+          ),
+        );
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setUploads((prev) =>
+            prev.map((p, idx) =>
+              idx === index ? { ...p, status: 'done', loaded: p.total } : p,
+            ),
+          );
+        } else {
+          let msg = `HTTP ${xhr.status}`;
+          try {
+            const parsed = JSON.parse(xhr.responseText);
+            if (parsed?.uploaded?.[0]?.error) msg = parsed.uploaded[0].error;
+            else if (parsed?.error) msg = parsed.error;
+          } catch {}
+          setUploads((prev) =>
+            prev.map((p, idx) => (idx === index ? { ...p, status: 'error', error: msg } : p)),
+          );
+        }
+        resolve();
+      };
+
+      xhr.onerror = () => {
+        setUploads((prev) =>
+          prev.map((p, idx) =>
+            idx === index ? { ...p, status: 'error', error: 'Network error' } : p,
+          ),
+        );
+        resolve();
+      };
+
+      xhr.onabort = () => {
+        setUploads((prev) =>
+          prev.map((p, idx) => (idx === index ? { ...p, status: 'canceled' } : p)),
+        );
+        resolve();
+      };
+
+      const fd = new FormData();
+      fd.append('path', targetPath);
+      fd.append('files', file);
+
+      xhr.open('POST', withCtx('/api/files/upload'));
+      xhr.send(fd);
+    });
+  }, [withCtx]);
+
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    setUploading(true);
-    try {
-      const formData = new FormData();
-      formData.append('path', currentPath);
-      for (let i = 0; i < files.length; i++) {
-        formData.append('files', files[i]);
-      }
+    const initial: UploadEntry[] = Array.from(files).map((f) => ({
+      name: f.name,
+      total: f.size,
+      loaded: 0,
+      status: 'queued' as UploadStatus,
+    }));
+    setUploads(initial);
+    uploadCanceledRef.current = false;
+    setError('');
 
-      const res = await fetch('/api/files/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (res.ok) {
-        await fetchDirectory(currentPath);
-      } else {
-        const data = await res.json();
-        setError(data.error || 'Upload failed');
+    const targetPath = currentPath;
+    for (let i = 0; i < files.length; i++) {
+      if (uploadCanceledRef.current) {
+        setUploads((prev) =>
+          prev.map((p, idx) =>
+            idx >= i && (p.status === 'queued' || p.status === 'uploading')
+              ? { ...p, status: 'canceled' }
+              : p,
+          ),
+        );
+        break;
       }
-    } catch {
-      setError('Upload failed');
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      await uploadOne(files[i], i, targetPath);
     }
+
+    uploadXhrRef.current = null;
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    await fetchDirectory(targetPath);
   };
+
+  const handleCancelUploads = useCallback(() => {
+    uploadCanceledRef.current = true;
+    if (uploadXhrRef.current) {
+      try { uploadXhrRef.current.abort(); } catch {}
+    }
+  }, []);
+
+  const handleDismissUploadPanel = useCallback(() => {
+    if (uploading) return; // refuse while in flight
+    setUploads([]);
+  }, [uploading]);
 
   const handleDownloadZip = async () => {
     setDownloading(true);
     try {
-      const res = await fetch(`/api/files/download-zip?path=${encodeURIComponent(currentPath)}`);
+      const res = await fetch(withCtx(`/api/files/download-zip?path=${encodeURIComponent(currentPath)}`));
       if (!res.ok) throw new Error();
       const blob = await res.blob();
       const dirName = currentPath.split('/').pop() || 'download';
@@ -212,10 +303,10 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     try {
       const fullPath = `${currentPath}/${name}`;
       const endpoint = createMode === 'folder' ? '/api/files/mkdir' : '/api/files/create';
-      const res = await fetch(endpoint, {
+      const res = await fetch(withCtx(endpoint), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: fullPath }),
+        body: JSON.stringify(ctxBody({ path: fullPath })),
       });
       if (res.ok) {
         setCreateMode(null);
@@ -273,10 +364,10 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
 
     setError('');
     try {
-      const res = await fetch('/api/files/move', {
+      const res = await fetch(withCtx('/api/files/move'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ src, dest }),
+        body: JSON.stringify(ctxBody({ src, dest })),
       });
       if (res.ok) {
         await fetchDirectory(currentPath);
@@ -309,10 +400,10 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
     if (src === dest) return;
 
     try {
-      const res = await fetch('/api/files/move', {
+      const res = await fetch(withCtx('/api/files/move'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ src, dest }),
+        body: JSON.stringify(ctxBody({ src, dest })),
       });
       if (res.ok) {
         await fetchDirectory(currentPath);
@@ -330,7 +421,9 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
   if (viewingFile) {
     return (
       <FileViewer
-        filePath={viewingFile}
+        filePath={viewingFile.path}
+        fileSize={viewingFile.size}
+        context={context}
         onBack={() => setViewingFile(null)}
       />
     );
@@ -529,6 +622,79 @@ export default function FileBrowser({ sessionCwd }: FileBrowserProps = {}) {
           </ul>
         )}
       </div>
+
+      {/* Upload progress panel — fixed overlay shown while uploads are in
+          flight or until dismissed after completion */}
+      {uploads.length > 0 && (
+        <div className="fixed bottom-4 right-4 left-4 sm:left-auto sm:w-96 bg-[#252540] border border-[#2d2d4a] rounded-lg shadow-xl z-50 flex flex-col max-h-[60vh]">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-[#2d2d4a]">
+            <div className="text-sm text-white font-medium">
+              {(() => {
+                const done = uploads.filter(u => u.status === 'done').length;
+                const failed = uploads.filter(u => u.status === 'error').length;
+                const canceled = uploads.filter(u => u.status === 'canceled').length;
+                const active = uploads.length - done - failed - canceled;
+                if (active > 0) return `Uploading ${done + 1}/${uploads.length}`;
+                if (failed > 0 || canceled > 0) return `Done — ${done} ok, ${failed} failed${canceled ? `, ${canceled} canceled` : ''}`;
+                return `Uploaded ${done} file${done === 1 ? '' : 's'}`;
+              })()}
+            </div>
+            {uploading ? (
+              <button
+                onClick={handleCancelUploads}
+                className="text-xs text-red-300 hover:text-red-200 font-medium px-2 py-1 rounded hover:bg-[#2d2d4a]"
+              >
+                Cancel
+              </button>
+            ) : (
+              <button
+                onClick={handleDismissUploadPanel}
+                className="text-slate-400 hover:text-white text-xs"
+                title="Dismiss"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+          <div className="overflow-y-auto px-4 py-3 space-y-3">
+            {uploads.map((u, i) => {
+              const pct = u.total > 0 ? Math.min(100, Math.round((u.loaded / u.total) * 100)) : 0;
+              const barColor =
+                u.status === 'error'    ? '#fc8181' :
+                u.status === 'canceled' ? '#a0aec0' :
+                u.status === 'done'     ? '#68d391' :
+                u.status === 'uploading'? '#4fd1c5' :
+                                          '#3d3d5c';
+              const rightText =
+                u.status === 'error'    ? (u.error || 'Failed') :
+                u.status === 'canceled' ? 'Canceled' :
+                u.status === 'done'     ? formatSize(u.total) :
+                                          `${formatSize(u.loaded)} / ${formatSize(u.total)}  ·  ${pct}%`;
+              return (
+                <div key={`${u.name}-${i}`} className="text-xs">
+                  <div className="flex justify-between gap-3 mb-1">
+                    <span className="text-slate-200 truncate flex-1 min-w-0" title={u.name}>{u.name}</span>
+                    <span
+                      className="flex-shrink-0 font-mono"
+                      style={{ color: u.status === 'error' ? '#fc8181' : '#94a3b8' }}
+                    >
+                      {rightText}
+                    </span>
+                  </div>
+                  <div className="h-1.5 bg-[#1a1a2e] rounded-full overflow-hidden">
+                    <div
+                      className={`h-full transition-all duration-150 ${u.status === 'uploading' ? '' : ''}`}
+                      style={{ width: `${u.status === 'done' ? 100 : pct}%`, backgroundColor: barColor }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

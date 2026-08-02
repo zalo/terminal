@@ -2,15 +2,19 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { WebLinksAddon } from '@xterm/addon-web-links';
+import { copyText } from '../lib/clipboard';
+import { MultilineUrlProvider } from '../lib/multilineLinks';
 
 interface TerminalProps {
   sessionName: string;
+  context?: string;
   onReady: (ref: {
     sendInput: (data: string) => void;
+    paste: (text: string) => void;
     focus: () => void;
     copySelection: () => Promise<void>;
     hasSelection: () => boolean;
+    enterSelectMode: () => void;
     scrollUp: () => void;
     scrollDown: () => void;
   }) => void;
@@ -19,7 +23,7 @@ interface TerminalProps {
 
 const TERMINAL_ROWS = 200; // Tall terminal for scrollback history
 
-export default function Terminal({ sessionName, onReady, onConnectionChange }: TerminalProps) {
+export default function Terminal({ sessionName, context, onReady, onConnectionChange }: TerminalProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerm | null>(null);
@@ -32,6 +36,9 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
   const isUnmountedRef = useRef(false);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(true);
+  const [selectText, setSelectText] = useState<string | null>(null);
+  const [copiedAll, setCopiedAll] = useState(false);
+  const overlayScrollRef = useRef<HTMLDivElement>(null);
 
   // Notify parent of connection state changes
   useEffect(() => {
@@ -45,26 +52,67 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
     }
   }, []);
 
+  const paste = useCallback((text: string) => {
+    // terminal.paste() respects bracketed paste mode, so multi-line pastes
+    // arrive as one block instead of executing line by line
+    terminalRef.current?.paste(text);
+    manualScrollRef.current = false;
+  }, []);
+
   const focus = useCallback(() => {
     terminalRef.current?.focus();
   }, []);
 
   const copySelection = useCallback(async () => {
-    if (terminalRef.current) {
-      const selection = terminalRef.current.getSelection();
-      if (selection) {
-        try {
-          await navigator.clipboard.writeText(selection);
-        } catch (e) {
-          console.error('Failed to copy:', e);
-        }
-      }
+    const selection = terminalRef.current?.getSelection();
+    if (selection) {
+      const ok = await copyText(selection);
+      if (!ok) console.error('Failed to copy selection');
     }
   }, []);
 
   const hasSelection = useCallback(() => {
     return terminalRef.current?.hasSelection() || false;
   }, []);
+
+  // Select mode: snapshot the buffer as plain text in an overlay where native
+  // browser selection (long-press on mobile, drag on desktop) just works —
+  // xterm's constant re-rendering can't clobber it.
+  const enterSelectMode = useCallback(() => {
+    const term = terminalRef.current;
+    if (!term) return;
+    const buf = term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      const text = line.translateToString(true);
+      if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    setSelectText(lines.join('\n'));
+  }, []);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectText(null);
+    setCopiedAll(false);
+    terminalRef.current?.focus();
+  }, []);
+
+  const handleCopyAll = useCallback(async () => {
+    if (selectText && (await copyText(selectText))) {
+      setCopiedAll(true);
+      setTimeout(() => setCopiedAll(false), 1500);
+    }
+  }, [selectText]);
+
+  // Mirror the terminal's scroll position when the overlay opens
+  useEffect(() => {
+    if (selectText !== null && overlayScrollRef.current && scrollContainerRef.current) {
+      overlayScrollRef.current.scrollTop = scrollContainerRef.current.scrollTop;
+    }
+  }, [selectText]);
 
   const scrollUp = useCallback(() => {
     if (scrollContainerRef.current) {
@@ -139,7 +187,7 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
 
     setConnecting(true);
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal?session=${sessionName}`;
+    const wsUrl = `${protocol}//${window.location.host}/ws/terminal?session=${encodeURIComponent(sessionName)}${context ? `&context=${encodeURIComponent(context)}` : ''}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -182,7 +230,7 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
         }
       }, 2000);
     };
-  }, [sessionName]);
+  }, [sessionName, context]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -228,14 +276,36 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
     terminal.loadAddon(fitAddon);
     fitAddonRef.current = fitAddon;
 
-    // Load web links addon
-    const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      window.open(uri, '_blank', 'noopener,noreferrer');
-    });
-    terminal.loadAddon(webLinksAddon);
+    // Linkify URLs, joining URLs hard-wrapped across lines (Claude Code
+    // indents and wraps long ones) into a single clickable link
+    terminal.registerLinkProvider(
+      new MultilineUrlProvider(terminal, (uri) => {
+        window.open(uri, '_blank', 'noopener,noreferrer');
+      })
+    );
 
     // Open terminal in container
     terminal.open(containerRef.current);
+
+    // Ctrl/Cmd+C copies an active selection instead of sending SIGINT (no
+    // selection: ^C still interrupts). Ctrl/Cmd+V is left entirely to the
+    // browser so the native paste event fires — otherwise xterm sends ^V to
+    // the shell, which Claude Code interprets as "paste image from host
+    // clipboard" and text paste never happens.
+    terminal.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.code === 'KeyV') return false;
+      if (mod && e.code === 'KeyC') {
+        if (terminal.hasSelection()) {
+          copyText(terminal.getSelection());
+          terminal.clearSelection();
+          return false;
+        }
+        if (e.shiftKey) return false;
+      }
+      return true;
+    });
 
     // Let wheel/scroll events pass through to the outer scroll container
     // instead of being intercepted by xterm (which converts them to arrow keys)
@@ -266,6 +336,65 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
       }
     });
 
+    // Inputs that manage their own clipboard (rich-text box, etc.) — the
+    // document-level handlers below must leave those alone.
+    const isForeignTarget = (t: EventTarget | null) => {
+      const el = t as HTMLElement | null;
+      if (!el) return false;
+      if (el.closest?.('.select-overlay')) return true;
+      return (
+        (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') &&
+        !el.classList.contains('xterm-helper-textarea')
+      );
+    };
+
+    const uploadPastedImage = async (file: File) => {
+      try {
+        const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+        const form = new FormData();
+        form.append('file', file, `pasted-image.${ext}`);
+        const res = await fetch('/api/paste-image', { method: 'POST', body: form });
+        if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+        const { path } = await res.json();
+        terminal.paste(path);
+      } catch (err) {
+        console.error('Failed to paste image:', err);
+      }
+    };
+
+    // Document-level paste: works no matter where focus ended up (buttons,
+    // body, xterm's hidden textarea). Images are uploaded to the server and
+    // their path typed into the terminal for CLI tools to read.
+    const handlePasteEvent = (e: ClipboardEvent) => {
+      if (isForeignTarget(e.target)) return;
+      if (!e.clipboardData) return;
+      e.preventDefault();
+      e.stopPropagation(); // keep xterm's own paste handler from double-pasting
+      const imageItem = Array.from(e.clipboardData.items).find(
+        (item) => item.kind === 'file' && item.type.startsWith('image/')
+      );
+      const imageFile = imageItem?.getAsFile();
+      if (imageFile) {
+        uploadPastedImage(imageFile);
+        return;
+      }
+      const text = e.clipboardData.getData('text/plain');
+      if (text) terminal.paste(text);
+    };
+
+    // Document-level copy: covers Edit-menu / context-menu copy while an
+    // xterm selection is active (there's no DOM selection to copy natively)
+    const handleCopyEvent = (e: ClipboardEvent) => {
+      if (isForeignTarget(e.target)) return;
+      if (terminal.hasSelection() && e.clipboardData) {
+        e.clipboardData.setData('text/plain', terminal.getSelection());
+        e.preventDefault();
+      }
+    };
+
+    document.addEventListener('paste', handlePasteEvent, true);
+    document.addEventListener('copy', handleCopyEvent, true);
+
     // Handle container resize - also notify server of new size
     const resizeObserver = new ResizeObserver(() => {
       updateCols();
@@ -281,7 +410,7 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
     }
 
     // Expose methods to parent
-    onReady({ sendInput, focus, copySelection, hasSelection, scrollUp, scrollDown });
+    onReady({ sendInput, paste, focus, copySelection, hasSelection, enterSelectMode, scrollUp, scrollDown });
 
     // Scroll to cursor position initially
     if (scrollContainerRef.current) {
@@ -301,12 +430,14 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
+      document.removeEventListener('paste', handlePasteEvent, true);
+      document.removeEventListener('copy', handleCopyEvent, true);
       resizeObserver.disconnect();
       wsRef.current?.close();
       webglAddonRef.current?.dispose();
       terminal.dispose();
     };
-  }, [sessionName, onReady, connectWebSocket, sendInput, focus, copySelection, hasSelection, scrollUp, scrollDown]);
+  }, [sessionName, onReady, connectWebSocket, sendInput, paste, focus, copySelection, hasSelection, enterSelectMode, scrollUp, scrollDown]);
 
   // Calculate container height based on viewport
   const containerStyle: React.CSSProperties = viewportHeight
@@ -314,15 +445,32 @@ export default function Terminal({ sessionName, onReady, onConnectionChange }: T
     : { height: '100%' };
 
   return (
-    <div
-      ref={scrollContainerRef}
-      className="terminal-scroll-container"
-      style={containerStyle}
-    >
+    <div className="relative" style={containerStyle}>
       <div
-        ref={containerRef}
-        className="terminal-inner"
-      />
+        ref={scrollContainerRef}
+        className="terminal-scroll-container"
+      >
+        <div
+          ref={containerRef}
+          className="terminal-inner"
+        />
+      </div>
+      {selectText !== null && (
+        <div className="select-overlay">
+          <div className="select-overlay-bar">
+            <span className="select-overlay-hint">Select text to copy</span>
+            <button className="control-btn px-3" onClick={handleCopyAll}>
+              {copiedAll ? 'Copied ✓' : 'Copy all'}
+            </button>
+            <button className="control-btn active px-3" onClick={exitSelectMode}>
+              Done
+            </button>
+          </div>
+          <div ref={overlayScrollRef} className="select-overlay-scroll">
+            <pre className="select-overlay-text">{selectText}</pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

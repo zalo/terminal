@@ -11,6 +11,43 @@ import type { IPty } from 'node-pty';
 import { spawn as cpSpawn, execSync, execFileSync, ChildProcess } from 'child_process';
 import readline from 'readline';
 import multer from 'multer';
+import busboy from 'busboy';
+import {
+  loadContexts,
+  listSessions as ctxListSessions,
+  sessionExists as ctxSessionExists,
+  createSession as ctxCreateSession,
+  killSession as ctxKillSession,
+  readMeta as ctxReadMeta,
+  deleteMeta as ctxDeleteMeta,
+  spawnAttachPty as ctxSpawnAttachPty,
+  mustFindContext,
+  defaultContext,
+  contextWorkspaceRoot,
+  isCtxPathSafe,
+  ctxReadDir,
+  ctxStat,
+  ctxReadFile,
+  ctxWriteFile,
+  ctxMkdir,
+  ctxTouch,
+  ctxMove,
+  ctxExists,
+  ctxDirSizes,
+  ctxOpenRead,
+  ctxWriteFileStream,
+  ctxSpawnZipStream,
+  type ContextsConfig,
+  type Context,
+} from './contexts';
+import {
+  initPush,
+  getVapidPublicKey,
+  addSubscription,
+  removeSubscription,
+  sendToAll,
+  listSubscriptions,
+} from './push';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -26,8 +63,473 @@ const tmuxSocketArg = TMUX_SOCKET ? `-S '${TMUX_SOCKET}'` : '';
 // See ~/.claude/hooks/terminal-meta.py and ~/.claude/bin/tm-meta.
 const META_DIR = process.env.CLAUDE_META_DIR || '/tmp/claude-terminal-meta';
 
+// Coordinator mode: if CONTEXTS_CONFIG points to a valid JSON file, session
+// endpoints fan out to each context (via sudo -u). Otherwise the server runs
+// in its original single-context mode — unchanged behavior.
+const contexts: ContextsConfig | null = loadContexts(process.env.CONTEXTS_CONFIG);
+const COORDINATOR_MODE = contexts !== null;
+
 app.use(cors());
 app.use(express.json());
+
+// --- Web Push initialization + endpoints -------------------------------------
+// Always on: web push works in single-context mode and coordinator mode alike.
+// VAPID keys are generated/loaded from config/vapid-keys.json on first boot.
+initPush();
+
+app.get('/api/push/vapid-public-key', (_req, res) => {
+  res.json({ publicKey: getVapidPublicKey() });
+});
+
+app.post('/api/push/subscribe', (req, res) => {
+  const { endpoint, keys, label } = req.body || {};
+  if (typeof endpoint !== 'string' || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({ error: 'Invalid subscription payload' });
+  }
+  addSubscription({
+    endpoint,
+    keys: { p256dh: String(keys.p256dh), auth: String(keys.auth) },
+    label: typeof label === 'string' ? label : undefined,
+    userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : undefined,
+  });
+  res.json({ success: true });
+});
+
+app.delete('/api/push/subscribe', (req, res) => {
+  const endpoint = (req.body?.endpoint || req.query.endpoint) as string | undefined;
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+  const removed = removeSubscription(endpoint);
+  res.json({ success: removed });
+});
+
+app.get('/api/push/subscriptions', (_req, res) => {
+  // Returns metadata only — never the keys.
+  const list = listSubscriptions().map((s) => ({
+    endpoint: s.endpoint,
+    label: s.label,
+    userAgent: s.userAgent,
+    createdAt: s.createdAt,
+  }));
+  res.json({ subscriptions: list, count: list.length });
+});
+
+// Local-only notify trigger: anything running on this machine can curl it,
+// but it is rejected for remote callers.
+app.post('/api/notify', async (req, res) => {
+  const raw = req.ip || req.socket.remoteAddress || '';
+  const isLocal =
+    raw === '127.0.0.1' || raw === '::1' || raw === '::ffff:127.0.0.1';
+  if (!isLocal) return res.status(403).json({ error: 'Local callers only' });
+
+  const { title, body, url, tag, icon, data } = req.body || {};
+  if (typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: 'title required' });
+  }
+  try {
+    const result = await sendToAll({
+      title: title.trim(),
+      body: typeof body === 'string' ? body : '',
+      url: typeof url === 'string' ? url : '/',
+      tag: typeof tag === 'string' ? tag : undefined,
+      icon: typeof icon === 'string' ? icon : undefined,
+      data: typeof data === 'object' && data ? data : undefined,
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// Pasted images: the frontend uploads clipboard images here, then types the
+// returned path into the terminal so CLI tools (e.g. Claude Code) can read the
+// file. Stored in the system temp dir, world-readable so context users can
+// access it in coordinator mode.
+const pasteUpload = multer({ dest: os.tmpdir(), limits: { fileSize: 50 * 1024 * 1024 } });
+app.post('/api/paste-image', pasteUpload.single('file'), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'No file provided' });
+  const ext = (path.extname(file.originalname) || '.png').toLowerCase();
+  const destPath = path.join(os.tmpdir(), `pasted-image-${Date.now()}${ext}`);
+  try {
+    fs.renameSync(file.path, destPath);
+    fs.chmodSync(destPath, 0o644);
+  } catch {
+    try { fs.unlinkSync(file.path); } catch {}
+    return res.status(500).json({ error: 'Failed to store pasted image' });
+  }
+  res.json({ path: destPath });
+});
+
+// /api/contexts is always registered. When coordinator mode is off it returns
+// an empty list, which the frontend treats as "single-context mode" and hides
+// all context UI. When on, it returns the real list.
+app.get('/api/contexts', (_req, res) => {
+  if (!COORDINATOR_MODE || !contexts) {
+    return res.json({ contexts: [] });
+  }
+  res.json({
+    contexts: contexts.contexts.map((c) => ({
+      name: c.name,
+      label: c.label,
+      user: c.user,
+    })),
+  });
+});
+
+// --- Coordinator routes (registered only when CONTEXTS_CONFIG is active) ----
+// These take precedence over the single-context handlers registered below
+// because Express matches routes in registration order.
+if (COORDINATOR_MODE && contexts) {
+  const sanitizeName = (raw: unknown): string => {
+    if (typeof raw !== 'string') return '';
+    return raw.replace(/[^a-zA-Z0-9-_]/g, '').slice(0, 50);
+  };
+
+  // Fan-out sessions list: every context's tmux sessions, tagged with context.
+  app.get('/api/sessions', (_req, res) => {
+    const out: Array<{
+      name: string;
+      context: string;
+      created: Date;
+      lastAccess: Date;
+      meta?: Record<string, unknown>;
+    }> = [];
+    for (const ctx of contexts.contexts) {
+      for (const row of ctxListSessions(ctx)) {
+        out.push({ ...row, meta: ctxReadMeta(ctx, row.name) });
+      }
+    }
+    res.json(out);
+  });
+
+  app.get('/api/sessions/:name/meta', (req, res) => {
+    const ctxName = (req.query.context as string) || defaultContext(contexts).name;
+    let ctx;
+    try { ctx = mustFindContext(contexts, ctxName); } catch { return res.status(404).json({ error: 'unknown context' }); }
+    const meta = ctxReadMeta(ctx, req.params.name);
+    res.json(meta || {});
+  });
+
+  app.post('/api/sessions', (req, res) => {
+    const ctxName = (req.body?.context as string) || defaultContext(contexts).name;
+    let ctx;
+    try { ctx = mustFindContext(contexts, ctxName); } catch { return res.status(400).json({ error: 'unknown context' }); }
+    const name = sanitizeName(req.body?.name);
+    if (!name) return res.status(400).json({ error: 'Invalid session name' });
+    if (ctxSessionExists(ctx, name)) return res.status(409).json({ error: 'Session already exists' });
+    if (ctxCreateSession(ctx, name)) return res.json({ name, context: ctx.name });
+    res.status(500).json({ error: 'Failed to create session' });
+  });
+
+  app.delete('/api/sessions/:name', (req, res) => {
+    const ctxName = (req.query.context as string) || defaultContext(contexts).name;
+    let ctx;
+    try { ctx = mustFindContext(contexts, ctxName); } catch { return res.status(404).json({ error: 'unknown context' }); }
+    if (ctxKillSession(ctx, req.params.name)) {
+      ctxDeleteMeta(ctx, req.params.name);
+      return res.json({ success: true });
+    }
+    res.status(404).json({ error: 'Session not found' });
+  });
+
+  // --- Files API (context-aware) -------------------------------------------
+  // Every file op takes ?context=X (default = admin) and runs as that context's
+  // user via sudo -u. Paths are constrained to the context's home dir.
+  const resolveCtxFromReq = (req: express.Request): Context | null => {
+    const name = (req.query.context as string) || (req.body?.context as string) || defaultContext(contexts).name;
+    try { return mustFindContext(contexts, name); } catch { return null; }
+  };
+
+  app.get('/api/config', (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    res.json({ rootPath: contextWorkspaceRoot(ctx), context: ctx.name });
+  });
+
+  app.get('/api/files', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const requestedPath = (req.query.path as string) || contextWorkspaceRoot(ctx);
+    if (!isCtxPathSafe(ctx, requestedPath)) return res.status(403).json({ error: 'Access denied' });
+    try {
+      const entries = await ctxReadDir(ctx, requestedPath);
+      entries.sort((a, b) => a.type !== b.type ? (a.type === 'directory' ? -1 : 1) : a.name.localeCompare(b.name));
+      const home = `/home/${ctx.user || os.userInfo().username}`;
+      const resolved = path.resolve(requestedPath);
+      const parent = resolved !== home ? path.dirname(resolved) : null;
+      res.json({
+        path: requestedPath,
+        parent,
+        files: entries,
+      });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  app.get('/api/files/dir-sizes', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const requestedPath = (req.query.path as string) || contextWorkspaceRoot(ctx);
+    if (!isCtxPathSafe(ctx, requestedPath)) return res.status(403).json({ error: 'Access denied' });
+    res.json({ sizes: await ctxDirSizes(ctx, requestedPath) });
+  });
+
+  app.get('/api/files/content', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const filePath = req.query.path as string;
+    if (!filePath || !isCtxPathSafe(ctx, filePath)) return res.status(403).json({ error: 'Access denied' });
+    try {
+      const st = await ctxStat(ctx, filePath);
+      if (!st) return res.status(404).json({ error: 'Not found' });
+      if (st.type === 'directory') return res.status(400).json({ error: 'Cannot read directory content' });
+      if (st.size > MAX_FILE_SIZE) return res.status(413).json({ error: 'File too large (max 6MB)' });
+      const buf = await ctxReadFile(ctx, filePath, MAX_FILE_SIZE);
+      res.json({ type: 'text', content: buf.toString('utf-8'), extension: path.extname(filePath).toLowerCase() });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  app.put('/api/files/content', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const filePath = req.body?.path as string;
+    const content = req.body?.content as string;
+    if (!filePath || typeof content !== 'string' || !isCtxPathSafe(ctx, filePath)) return res.status(403).json({ error: 'Access denied' });
+    try {
+      await ctxWriteFile(ctx, filePath, Buffer.from(content, 'utf-8'));
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  app.post('/api/files/mkdir', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const dirPath = req.body?.path as string;
+    if (!dirPath || !isCtxPathSafe(ctx, dirPath)) return res.status(403).json({ error: 'Access denied' });
+    if (await ctxExists(ctx, dirPath)) return res.status(409).json({ error: 'Already exists' });
+    try { await ctxMkdir(ctx, dirPath); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: (e as Error).message }); }
+  });
+
+  app.post('/api/files/create', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const filePath = req.body?.path as string;
+    if (!filePath || !isCtxPathSafe(ctx, filePath)) return res.status(403).json({ error: 'Access denied' });
+    if (await ctxExists(ctx, filePath)) return res.status(409).json({ error: 'Already exists' });
+    try { await ctxTouch(ctx, filePath); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: (e as Error).message }); }
+  });
+
+  app.post('/api/files/move', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const src = req.body?.src as string;
+    const dest = req.body?.dest as string;
+    if (!src || !dest || !isCtxPathSafe(ctx, src) || !isCtxPathSafe(ctx, dest)) return res.status(403).json({ error: 'Access denied' });
+    if (!(await ctxExists(ctx, src))) return res.status(404).json({ error: 'Source not found' });
+    if (await ctxExists(ctx, dest)) return res.status(409).json({ error: 'Destination already exists' });
+    try { await ctxMove(ctx, src, dest); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: (e as Error).message }); }
+  });
+
+  app.get('/api/files/download-zip', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const dirPath = req.query.path as string;
+    if (!dirPath || !isCtxPathSafe(ctx, dirPath)) return res.status(403).json({ error: 'Access denied' });
+    const st = await ctxStat(ctx, dirPath);
+    if (!st) return res.status(404).json({ error: 'Directory not found' });
+    if (st.type !== 'directory') return res.status(400).json({ error: 'Path is not a directory' });
+
+    const dirName = path.basename(dirPath) || 'download';
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${dirName}.zip"`);
+
+    const stream = ctxSpawnZipStream(ctx, dirPath);
+    stream.pipe(res);
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to create zip' });
+    });
+    req.on('close', () => { stream.kill?.(); });
+  });
+
+  // Upload via busboy: stream each file part directly from the request into
+  // `sudo -u <user> tee <dest>` without staging on /tmp. This means:
+  //   - large files don't need /tmp to have free space equal to the upload
+  //   - the network rate is the rate the disk + tee process can absorb
+  //     (pipe() backpressure handles this naturally)
+  //   - per-file results are streamed back as JSON when all parts finish
+  const UPLOAD_FILE_LIMIT = parseInt(
+    process.env.UPLOAD_FILE_LIMIT_BYTES || String(50 * 1024 * 1024 * 1024),
+    10,
+  );
+  app.post('/api/files/upload', (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+
+    let targetDir: string | null = null;
+    let targetVerified = false;
+    const results: { name: string; size: number; error?: string; truncated?: boolean }[] = [];
+    const pending: Promise<void>[] = [];
+    let earlyError: string | null = null;
+    let finished = false;
+
+    const bb = busboy({
+      headers: req.headers,
+      limits: { fileSize: UPLOAD_FILE_LIMIT, files: 64 },
+    });
+
+    const verifyTarget = async (): Promise<boolean> => {
+      if (targetVerified) return true;
+      if (!targetDir) {
+        earlyError = 'path field is required';
+        return false;
+      }
+      if (!isCtxPathSafe(ctx, targetDir)) {
+        earlyError = 'Access denied';
+        return false;
+      }
+      const st = await ctxStat(ctx, targetDir);
+      if (!st || st.type !== 'directory') {
+        earlyError = 'Target directory does not exist';
+        return false;
+      }
+      targetVerified = true;
+      return true;
+    };
+
+    bb.on('field', (name, value) => {
+      if (name === 'path') targetDir = String(value);
+      if (name === 'context') {
+        // Field-based context override (form-only — query string still wins
+        // via resolveCtxFromReq above)
+      }
+    });
+
+    bb.on('file', (_fieldname, fileStream, info) => {
+      const filename = info.filename || 'upload';
+      // Defer the actual write until target is verified; while waiting, pause.
+      const handleFile = async () => {
+        const ok = await verifyTarget();
+        if (!ok) {
+          fileStream.resume();
+          results.push({ name: filename, size: 0, error: earlyError || 'failed' });
+          return;
+        }
+        const destPath = path.join(targetDir as string, filename);
+        if (!isCtxPathSafe(ctx, destPath)) {
+          fileStream.resume();
+          results.push({ name: filename, size: 0, error: 'Access denied' });
+          return;
+        }
+
+        let bytes = 0;
+        let truncated = false;
+        fileStream.on('data', (chunk: Buffer) => { bytes += chunk.length; });
+        fileStream.on('limit', () => { truncated = true; });
+
+        try {
+          await ctxWriteFileStream(ctx, destPath, fileStream);
+          if (truncated) {
+            results.push({ name: filename, size: bytes, error: 'File exceeded UPLOAD_FILE_LIMIT_BYTES; truncated', truncated: true });
+          } else {
+            results.push({ name: filename, size: bytes });
+          }
+        } catch (e) {
+          results.push({ name: filename, size: bytes, error: (e as Error).message });
+        }
+      };
+      pending.push(handleFile());
+    });
+
+    const respond = async () => {
+      if (finished) return;
+      finished = true;
+      try {
+        await Promise.all(pending);
+      } catch {}
+      if (results.length === 0 && earlyError) {
+        return res.status(400).json({ error: earlyError });
+      }
+      if (results.length === 0) {
+        return res.status(400).json({ error: 'No file provided' });
+      }
+      res.json({ uploaded: results });
+    };
+
+    bb.on('finish', respond);
+    bb.on('close', respond);
+    bb.on('error', (e: Error) => {
+      if (!res.headersSent) res.status(500).json({ error: e.message });
+      finished = true;
+    });
+
+    req.on('aborted', () => {
+      // Client disconnected mid-upload; busboy will fire close. Mark any
+      // pending writes as canceled by destroying the request stream (the
+      // file streams downstream will error out and reject their promises).
+      finished = true;
+    });
+
+    req.pipe(bb);
+  });
+
+  app.get('/api/files/stream', async (req, res) => {
+    const ctx = resolveCtxFromReq(req);
+    if (!ctx) return res.status(404).json({ error: 'unknown context' });
+    const filePath = req.query.path as string;
+    if (!filePath || !isCtxPathSafe(ctx, filePath)) return res.status(403).json({ error: 'Access denied' });
+    const st = await ctxStat(ctx, filePath);
+    if (!st) return res.status(404).end();
+    if (st.type === 'directory') return res.status(400).end();
+
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
+      '.ico': 'image/x-icon', '.mp4': 'video/mp4', '.webm': 'video/webm',
+      '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo',
+    };
+    res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    // ?download=1 forces the browser to save instead of inline-render.
+    if (req.query.download === '1') {
+      const fileName = path.basename(filePath);
+      const asciiFallback = fileName.replace(/[^\x20-\x7e]+/g, '_').replace(/"/g, '\\"');
+      const utf8Pct = encodeURIComponent(fileName);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiFallback}"; filename*=UTF-8''${utf8Pct}`,
+      );
+    }
+
+    const fileSize = st.size;
+    const range = req.headers.range;
+    if (range) {
+      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader('Content-Length', end - start + 1);
+      res.status(206);
+      const stream = ctxOpenRead(ctx, filePath, { start, end });
+      stream.pipe(res);
+      req.on('close', () => { try { (stream as any).destroy?.(); } catch {} });
+    } else {
+      res.setHeader('Content-Length', fileSize);
+      const stream = ctxOpenRead(ctx, filePath);
+      stream.pipe(res);
+      req.on('close', () => { try { (stream as any).destroy?.(); } catch {} });
+    }
+  });
+}
 
 // Serve static files in production
 const distPath = path.join(__dirname, '../../frontend/dist');
@@ -1059,6 +1561,7 @@ const connections = new Map<string, TerminalConnection>();
 terminalWss.on('connection', (ws, req) => {
   const url = new URL(req.url || '', `http://${req.headers.host}`);
   const sessionName = url.searchParams.get('session');
+  const ctxName = url.searchParams.get('context');
 
   if (!sessionName) {
     ws.close(1008, 'Session name required');
@@ -1066,28 +1569,52 @@ terminalWss.on('connection', (ws, req) => {
   }
 
   const sanitized = sessionName.replace(/[^a-zA-Z0-9-_]/g, '');
-  console.log(`Connecting to session: ${sanitized}`);
+  console.log(`Connecting to session: ${sanitized}${ctxName ? ` (ctx=${ctxName})` : ''}`);
 
-  if (!sessionExists(sanitized)) {
-    if (!createTmuxSession(sanitized)) {
-      ws.close(1011, 'Failed to create session');
+  // Coordinator path: resolve the requested context (default = admin), then
+  // create+attach via sudo -u when the context has a non-null user.
+  let pty: IPty;
+  if (COORDINATOR_MODE && contexts) {
+    let ctx;
+    try {
+      ctx = mustFindContext(contexts, ctxName || defaultContext(contexts).name);
+    } catch {
+      ws.close(1008, 'Unknown context');
       return;
     }
+    if (!ctxSessionExists(ctx, sanitized)) {
+      if (!ctxCreateSession(ctx, sanitized)) {
+        ws.close(1011, 'Failed to create session');
+        return;
+      }
+    }
+    pty = ctxSpawnAttachPty(ctx, sanitized, {
+      cols: 80,
+      rows: 24,
+      env: { ...process.env, TERM: 'xterm-256color' },
+    });
+  } else {
+    // Single-context (original) path.
+    if (!sessionExists(sanitized)) {
+      if (!createTmuxSession(sanitized)) {
+        ws.close(1011, 'Failed to create session');
+        return;
+      }
+    }
+    const tmuxArgs = TMUX_SOCKET
+      ? ['-S', TMUX_SOCKET, 'attach-session', '-t', sanitized]
+      : ['attach-session', '-t', sanitized];
+    pty = spawn('tmux', tmuxArgs, {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: WORKSPACE_ROOT,
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+      },
+    });
   }
-
-  const tmuxArgs = TMUX_SOCKET
-    ? ['-S', TMUX_SOCKET, 'attach-session', '-t', sanitized]
-    : ['attach-session', '-t', sanitized];
-  const pty = spawn('tmux', tmuxArgs, {
-    name: 'xterm-256color',
-    cols: 80,
-    rows: 24,
-    cwd: WORKSPACE_ROOT,
-    env: {
-      ...process.env,
-      TERM: 'xterm-256color',
-    },
-  });
 
   const connectionId = `${sanitized}-${Date.now()}`;
   connections.set(connectionId, { pty, ws });
@@ -1193,7 +1720,81 @@ app.use((_req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Using tmux socket: ${TMUX_SOCKET || 'default'}`);
-});
+// --- Listeners ---------------------------------------------------------------
+//
+// Two sockets with two trust levels:
+//
+//  1. MAIN app (terminal WS, chat WS, files/sessions API — i.e. arbitrary code
+//     execution as this user) listens ONLY on a Unix-domain socket owned by
+//     this user, mode 0600. cloudflared runs as the same user and is pointed at
+//     `service: unix:<TERMINAL_SOCKET>`, so it can reach the app — but no other
+//     local account (agent-*) and nothing on the network can open the socket.
+//     There is no TCP port for the terminal API; the OS enforces the boundary.
+//
+//  2. NOTIFY-only listener on TCP 127.0.0.1:<PORT>, exposing solely
+//     POST /api/notify. Local automation running as any user (tm-notify from an
+//     agent-* account) posts here. The terminal API is NOT mounted on it, so a
+//     local caller gets nothing else.
+//
+// Set TERMINAL_TCP=1 to serve the main app on TCP instead — used by dev.sh,
+// where Vite proxies to the backend over TCP.
+
+function startNotifyListener() {
+  const notifyApp = express();
+  notifyApp.use(express.json({ limit: '16kb' }));
+
+  const clip = (v: unknown, max: number): string =>
+    typeof v === 'string' ? v.slice(0, max) : '';
+
+  // Accept only same-origin relative paths ("/foo"). Reject absolute/scheme
+  // URLs and protocol-relative "//host" so a local caller (incl. untrusted
+  // agent accounts) can't craft a notification whose tap-through opens an
+  // attacker page, or whose icon leaks the device to a third-party server.
+  const safeRelPath = (v: unknown, fallback: string | undefined): string | undefined => {
+    if (typeof v === 'string' && v.startsWith('/') && !v.startsWith('//')) return v.slice(0, 512);
+    return fallback;
+  };
+
+  notifyApp.post('/api/notify', async (req, res) => {
+    const title = clip(req.body?.title, 200).trim();
+    if (!title) return res.status(400).json({ error: 'title required' });
+    try {
+      const result = await sendToAll({
+        title,
+        body: clip(req.body?.body, 1000),
+        url: safeRelPath(req.body?.url, '/'),
+        tag: req.body?.tag ? clip(req.body.tag, 100) : undefined,
+        icon: safeRelPath(req.body?.icon, undefined),
+        data: typeof req.body?.data === 'object' && req.body.data ? req.body.data : undefined,
+      });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  // 404 everything else — this listener is unmistakably notify-only.
+  notifyApp.use((_req, res) => res.status(404).json({ error: 'not found' }));
+
+  http.createServer(notifyApp).listen(Number(PORT), '127.0.0.1', () => {
+    console.log(`Notify listener on http://127.0.0.1:${PORT}/api/notify (loopback; all local users)`);
+  });
+}
+
+if (process.env.TERMINAL_TCP === '1') {
+  const HOST = process.env.HOST || '127.0.0.1';
+  server.listen(Number(PORT), HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT} (TERMINAL_TCP)`);
+    console.log(`Using tmux socket: ${TMUX_SOCKET || 'default'}`);
+  });
+} else {
+  const SOCK = process.env.TERMINAL_SOCKET
+    || path.join(process.env.XDG_RUNTIME_DIR || os.tmpdir(), 'terminal-server.sock');
+  try { if (fs.existsSync(SOCK)) fs.unlinkSync(SOCK); } catch {}
+  server.listen(SOCK, () => {
+    try { fs.chmodSync(SOCK, 0o600); } catch {}
+    console.log(`Server running on unix:${SOCK} (mode 0600, ${os.userInfo().username} only)`);
+    console.log(`Using tmux socket: ${TMUX_SOCKET || 'default'}`);
+    startNotifyListener();
+  });
+}

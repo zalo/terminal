@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""tm-notify: trigger a web push notification to all subscribed devices.
+
+Usage:
+  tm-notify "Title"
+  tm-notify "Title" "Body text"
+  tm-notify "Build done" "All tests pass" --url http://localhost:5173
+  tm-notify "Heads up" --tag deploy --url /?session=work
+
+The server endpoint /api/notify is restricted to loopback callers, so this
+only works from a shell on the host running terminal-server.
+
+Reads PORT from $TERMINAL_PORT, falling back to 3000.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="tm-notify", description="Send a push notification to subscribed devices.")
+    ap.add_argument("title", help="Notification title")
+    ap.add_argument("body", nargs="?", default="", help="Optional body text")
+    ap.add_argument("--url", default="/", help="URL to open on click (default: /)")
+    ap.add_argument("--tag", default=None, help="Notification tag (notifications with the same tag replace one another)")
+    ap.add_argument("--icon", default=None, help="Override notification icon URL")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("TERMINAL_PORT", "3000")), help="Terminal server port (default 3000 or $TERMINAL_PORT)")
+    args = ap.parse_args()
+
+    payload = {"title": args.title, "body": args.body, "url": args.url}
+    if args.tag:
+        payload["tag"] = args.tag
+    if args.icon:
+        payload["icon"] = args.icon
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{args.port}/api/notify",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(resp.read().decode("utf-8"))
+            return 0
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"tm-notify: HTTP {e.code} {e.reason}\n")
+        try:
+            sys.stderr.write(e.read().decode("utf-8") + "\n")
+        except Exception:
+            pass
+        return 1
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"tm-notify: connection failed: {e.reason}\n")
+        sys.stderr.write(f"  is terminal-server running on port {args.port}?\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

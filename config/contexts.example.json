@@ -1,0 +1,45 @@
+{
+  "$schema_comment": "Each context is a tmux identity. 'user: null' means the admin (the user running the server). Non-null 'user' means the coordinator will sudo -u <user> to run tmux commands for this context. 'tmuxSocket' is the tmux socket path for that context's sessions. 'metaDir' is the directory Claude Code's hook writes per-session JSON into for that context. 'label' is what the UI shows.",
+  "contexts": [
+    {
+      "name": "admin",
+      "user": null,
+      "label": "Admin",
+      "tmuxSocket": "/tmp/orchestrator-tmux.sock",
+      "metaDir": "/tmp/claude-terminal-meta",
+      "cwd": "/home/selstad/Desktop"
+    },
+    {
+      "name": "work",
+      "user": "agent-work",
+      "label": "Work",
+      "tmuxSocket": "/tmp/terminal-work.sock",
+      "metaDir": "/tmp/claude-terminal-meta-agent-work",
+      "cwd": "/home/agent-work/Desktop"
+    },
+    {
+      "name": "john",
+      "user": "agent-john",
+      "label": "John",
+      "tmuxSocket": "/tmp/terminal-john.sock",
+      "metaDir": "/tmp/claude-terminal-meta-agent-john",
+      "cwd": "/home/agent-john/Desktop"
+    },
+    {
+      "name": "untrusted",
+      "user": "agent-untrusted",
+      "label": "Untrusted",
+      "tmuxSocket": "/tmp/terminal-untrusted.sock",
+      "metaDir": "/tmp/claude-terminal-meta-agent-untrusted",
+      "cwd": "/home/agent-untrusted/Desktop"
+    },
+    {
+      "name": "tom",
+      "user": "agent-tom",
+      "label": "Tom",
+      "tmuxSocket": "/tmp/terminal-tom.sock",
+      "metaDir": "/tmp/claude-terminal-meta-agent-tom",
+      "cwd": "/home/agent-tom/Desktop"
+    }
+  ]
+}

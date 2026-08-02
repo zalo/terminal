@@ -3,8 +3,9 @@
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
 
-# Start server on port 3002 with tsx watch
-(cd "$BASE/server" && PORT=3002 npm run dev) &
+# Start server on port 3002 with tsx watch. TERMINAL_TCP=1 keeps the backend on
+# a TCP port (prod serves the main app on a Unix socket) so Vite can proxy to it.
+(cd "$BASE/server" && TERMINAL_TCP=1 PORT=3002 npm run dev) &
 SERVER_PID=$!
 
 # Wait for server to start

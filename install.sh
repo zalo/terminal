@@ -92,7 +92,8 @@ if [[ "$INSTALL_HOOKS" -eq 1 ]]; then
   mkdir -p "$HOOKS_DIR" "$BIN_DIR"
   install -m 0755 "$REPO_DIR/scripts/hooks/terminal-meta.py" "$HOOKS_DIR/terminal-meta.py"
   install -m 0755 "$REPO_DIR/scripts/bin/tm-meta"             "$BIN_DIR/tm-meta"
-  log "installed terminal-meta.py → $HOOKS_DIR and tm-meta → $BIN_DIR"
+  install -m 0755 "$REPO_DIR/scripts/bin/tm-notify"           "$BIN_DIR/tm-notify"
+  log "installed terminal-meta.py → $HOOKS_DIR and tm-meta / tm-notify → $BIN_DIR"
 
   # Idempotently merge hook entries into settings.json via Python.
   HOOK_CMD="$HOOKS_DIR/terminal-meta.py" python3 - "$SETTINGS" <<'PY'

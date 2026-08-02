@@ -3,9 +3,11 @@ import Terminal from './Terminal';
 import ControlBar from './ControlBar';
 import FileBrowser from './FileBrowser';
 import ChatView from './ChatView.tsx';
+import { readClipboardText } from '../lib/clipboard';
 
 interface TerminalViewProps {
   sessionName: string;
+  context?: string;
   onBack: () => void;
 }
 
@@ -13,9 +15,11 @@ type Tab = 'terminal' | 'files' | 'chat' | 'preview';
 
 interface TerminalRef {
   sendInput: (data: string) => void;
+  paste: (text: string) => void;
   focus: () => void;
   copySelection: () => Promise<void>;
   hasSelection: () => boolean;
+  enterSelectMode: () => void;
   scrollUp: () => void;
   scrollDown: () => void;
 }
@@ -36,7 +40,7 @@ const STATUS_STYLES: Record<string, { color: string; label: string; pulse: boole
   idle:     { color: '#718096', label: 'idle',     pulse: false },
 };
 
-export default function TerminalView({ sessionName, onBack }: TerminalViewProps) {
+export default function TerminalView({ sessionName, context, onBack }: TerminalViewProps) {
   const [activeTab, setActiveTab] = useState<Tab>('terminal');
   const [terminalRef, setTerminalRef] = useState<TerminalRef | null>(null);
   const [connected, setConnected] = useState(false);
@@ -51,7 +55,8 @@ export default function TerminalView({ sessionName, onBack }: TerminalViewProps)
     let cancelled = false;
     const fetchMeta = async () => {
       try {
-        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionName)}/meta`);
+        const metaUrl = `/api/sessions/${encodeURIComponent(sessionName)}/meta${context ? `?context=${encodeURIComponent(context)}` : ''}`;
+        const res = await fetch(metaUrl);
         if (!res.ok) return;
         const data = await res.json();
         if (!cancelled) setMeta(data || {});
@@ -60,7 +65,7 @@ export default function TerminalView({ sessionName, onBack }: TerminalViewProps)
     fetchMeta();
     const id = setInterval(fetchMeta, 2000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [sessionName]);
+  }, [sessionName, context]);
 
   // If the user was on the Preview tab and the preview URL disappears, fall back to Terminal.
   useEffect(() => {
@@ -79,17 +84,27 @@ export default function TerminalView({ sessionName, onBack }: TerminalViewProps)
     }
   };
 
+  const handleCopy = async () => {
+    if (!terminalRef) return;
+    if (terminalRef.hasSelection()) {
+      await terminalRef.copySelection();
+    } else {
+      // Nothing selected — open the plain-text overlay for native selection
+      terminalRef.enterSelectMode();
+    }
+  };
+
   const handlePaste = async () => {
-    if (terminalRef) {
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text) {
-          terminalRef.sendInput(text);
-          terminalRef.focus();
-        }
-      } catch (e) {
-        console.error('Failed to paste:', e);
-      }
+    if (!terminalRef) return;
+    const text = await readClipboardText();
+    if (text) {
+      terminalRef.paste(text);
+      terminalRef.focus();
+    } else {
+      // Clipboard API unavailable (http origin) or permission denied — open
+      // the text box so the user can paste natively and hit Send.
+      setInputVisible(true);
+      setTimeout(() => textareaRef.current?.focus(), 50);
     }
   };
 
@@ -199,6 +214,7 @@ export default function TerminalView({ sessionName, onBack }: TerminalViewProps)
       {activeTab === 'terminal' && (
         <ControlBar
           onKey={handleControlKey}
+          onCopy={handleCopy}
           onPaste={handlePaste}
           onToggleInput={handleToggleInput}
           inputVisible={inputVisible}
@@ -232,11 +248,12 @@ export default function TerminalView({ sessionName, onBack }: TerminalViewProps)
         {activeTab === 'terminal' && (
           <Terminal
             sessionName={sessionName}
+            context={context}
             onReady={setTerminalRef}
             onConnectionChange={handleConnectionChange}
           />
         )}
-        {activeTab === 'files' && <FileBrowser sessionCwd={meta.cwd} />}
+        {activeTab === 'files' && <FileBrowser sessionCwd={meta.cwd} context={context} />}
         {activeTab === 'chat' && <ChatView sessionName={sessionName} />}
         {activeTab === 'preview' && meta.preview_url && (
           <iframe

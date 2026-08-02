@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import NotificationToggle from './NotificationToggle';
 
 interface SessionMeta {
   status?: 'working' | 'waiting' | 'finished' | 'idle';
@@ -10,13 +11,20 @@ interface SessionMeta {
 
 interface Session {
   name: string;
+  context?: string;
   created: string;
   lastAccess: string;
   meta?: SessionMeta;
 }
 
+interface ContextInfo {
+  name: string;
+  label: string;
+  user: string | null;
+}
+
 interface SessionListProps {
-  onSelectSession: (name: string) => void;
+  onSelectSession: (name: string, context?: string) => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -25,6 +33,18 @@ const STATUS_COLORS: Record<string, string> = {
   finished: '#68d391',
   idle: '#718096',
 };
+
+// Per-context accent colors — map deterministically by name so they stay stable.
+const CONTEXT_COLORS: Record<string, string> = {
+  admin: '#a0aec0',
+  work: '#f6ad55',
+  john: '#4fd1c5',
+  untrusted: '#fc8181',
+  tom: '#b794f4',
+};
+function contextColor(name: string): string {
+  return CONTEXT_COLORS[name] || '#718096';
+}
 
 function formatTimeAgo(dateStr: string): string {
   const date = new Date(dateStr);
@@ -44,10 +64,14 @@ function formatTimeAgo(dateStr: string): string {
 
 export default function SessionList({ onSelectSession }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [contexts, setContexts] = useState<ContextInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [newSessionName, setNewSessionName] = useState('');
+  const [newSessionContext, setNewSessionContext] = useState<string>('');
   const [showNewSession, setShowNewSession] = useState(false);
   const [error, setError] = useState('');
+
+  const multiContext = contexts.length > 0;
 
   const fetchSessions = async () => {
     try {
@@ -61,10 +85,27 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
     }
   };
 
+  const fetchContexts = async () => {
+    try {
+      const res = await fetch('/api/contexts');
+      if (!res.ok) { setContexts([]); return; }
+      const data = await res.json();
+      const list: ContextInfo[] = data?.contexts || [];
+      setContexts(list);
+      if (list.length > 0 && !newSessionContext) {
+        setNewSessionContext(list[0].name);
+      }
+    } catch {
+      setContexts([]);
+    }
+  };
+
   useEffect(() => {
+    fetchContexts();
     fetchSessions();
     const id = setInterval(fetchSessions, 3000);
     return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleCreateSession = async () => {
@@ -77,12 +118,15 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newSessionName.trim() }),
+        body: JSON.stringify({
+          name: newSessionName.trim(),
+          ...(multiContext ? { context: newSessionContext } : {}),
+        }),
       });
 
       if (res.ok) {
-        const { name } = await res.json();
-        onSelectSession(name);
+        const { name, context } = await res.json();
+        onSelectSession(name, context);
       } else {
         const { error } = await res.json();
         setError(error || 'Failed to create session');
@@ -98,9 +142,14 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
         <h1 className="text-2xl font-semibold text-white text-center mb-2 mt-8">
           Terminal Sessions
         </h1>
-        <p className="text-slate-400 text-center mb-8 text-sm">
-          Select a session or create a new one
+        <p className="text-slate-400 text-center mb-4 text-sm">
+          {multiContext
+            ? `Select a session — grouped by context.`
+            : `Select a session or create a new one`}
         </p>
+        <div className="flex justify-center mb-6">
+          <NotificationToggle />
+        </div>
 
         <div className="flex-1 overflow-y-auto min-h-0">
           {loading ? (
@@ -117,10 +166,11 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
                     const status = session.meta?.status;
                     const statusColor = status ? STATUS_COLORS[status] : '#4fd1c5';
                     const pulse = status === 'working';
+                    const ctxColor = session.context ? contextColor(session.context) : null;
                     return (
-                      <li key={session.name}>
+                      <li key={`${session.context || 'default'}:${session.name}`}>
                         <button
-                          onClick={() => onSelectSession(session.name)}
+                          onClick={() => onSelectSession(session.name, session.context)}
                           className="w-full px-4 py-4 flex items-start justify-between gap-3 hover:bg-[#2d2d4a] transition-colors text-left"
                         >
                           <div className="flex items-start gap-3 min-w-0 flex-1">
@@ -130,7 +180,15 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
                               title={status || 'no claude session'}
                             />
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {multiContext && session.context && ctxColor && (
+                                  <span
+                                    className="text-[10px] uppercase tracking-wide font-bold px-1.5 py-0.5 rounded flex-shrink-0"
+                                    style={{ backgroundColor: `${ctxColor}22`, color: ctxColor, border: `1px solid ${ctxColor}55` }}
+                                  >
+                                    {session.context}
+                                  </span>
+                                )}
                                 <span className="text-white font-medium truncate">
                                   {session.name}
                                 </span>
@@ -189,6 +247,33 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
         <div className="mt-6 flex-shrink-0">
           {showNewSession ? (
             <div className="bg-[#252540] rounded-lg p-4 border border-[#2d2d4a]">
+              {multiContext && (
+                <div className="mb-3">
+                  <label className="block text-xs uppercase tracking-wide text-slate-400 mb-2">
+                    Context
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    {contexts.map((c) => {
+                      const selected = c.name === newSessionContext;
+                      const color = contextColor(c.name);
+                      return (
+                        <button
+                          key={c.name}
+                          onClick={() => setNewSessionContext(c.name)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-semibold uppercase tracking-wide transition-colors"
+                          style={{
+                            backgroundColor: selected ? color : `${color}22`,
+                            color: selected ? '#1a1a2e' : color,
+                            border: `1px solid ${selected ? color : `${color}55`}`,
+                          }}
+                        >
+                          {c.label || c.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               <input
                 type="text"
                 value={newSessionName}
