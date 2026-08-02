@@ -311,6 +311,21 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
     // instead of being intercepted by xterm (which converts them to arrow keys)
     terminal.attachCustomWheelEventHandler(() => false);
 
+    // The custom wheel handler above isn't enough when the app inside tmux
+    // enables mouse reporting (Claude Code does): xterm binds its own wheel
+    // listener that unconditionally preventDefaults, killing trackpad/wheel
+    // scrolling on desktop. Stop wheel events in the capture phase so they
+    // never reach xterm and the container scrolls natively.
+    const scrollContainer = scrollContainerRef.current;
+    const handleWheelCapture = (e: WheelEvent) => {
+      e.stopPropagation();
+      manualScrollRef.current = true; // same as the scroll buttons: don't auto-jump to cursor
+    };
+    scrollContainer?.addEventListener('wheel', handleWheelCapture, {
+      capture: true,
+      passive: true,
+    });
+
     // WebGL disabled — causes glyph corruption on this system (Playwright Chrome install may have broken GPU context)
     // Using xterm.js DOM renderer instead
 
@@ -432,6 +447,7 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
       }
       document.removeEventListener('paste', handlePasteEvent, true);
       document.removeEventListener('copy', handleCopyEvent, true);
+      scrollContainer?.removeEventListener('wheel', handleWheelCapture, true);
       resizeObserver.disconnect();
       wsRef.current?.close();
       webglAddonRef.current?.dispose();
