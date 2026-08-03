@@ -271,6 +271,22 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
 
     terminalRef.current = terminal;
 
+    // TUIs like Claude Code (and tmux with mouse on) enable terminal mouse
+    // tracking, which makes xterm forward drags to the app instead of
+    // selecting locally — "selections" then land in tmux's paste buffer
+    // ("paste with prefix + ]") and never reach the system clipboard. Swallow
+    // the tracking-enable sequences so dragging always selects locally.
+    // Scrolling is unaffected (the outer container owns wheel/touch scroll).
+    const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]);
+    terminal.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => {
+      const flat: number[] = [];
+      for (const p of params) {
+        if (Array.isArray(p)) flat.push(...p);
+        else flat.push(p);
+      }
+      return flat.length > 0 && flat.every((p) => MOUSE_TRACKING_MODES.has(p));
+    });
+
     // Load fit addon
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
@@ -410,6 +426,40 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
     document.addEventListener('paste', handlePasteEvent, true);
     document.addEventListener('copy', handleCopyEvent, true);
 
+    // iOS/touch: long-press opens the native-selection overlay, since touch
+    // can't drive xterm's mouse-based selection model
+    let touchTimer: number | null = null;
+    let touchStartX = 0;
+    let touchStartY = 0;
+    const clearTouchTimer = () => {
+      if (touchTimer !== null) {
+        clearTimeout(touchTimer);
+        touchTimer = null;
+      }
+    };
+    const handleTouchStart = (e: TouchEvent) => {
+      clearTouchTimer();
+      if (e.touches.length !== 1) return;
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      touchTimer = window.setTimeout(() => {
+        touchTimer = null;
+        enterSelectMode();
+      }, 500);
+    };
+    const handleTouchMove = (e: TouchEvent) => {
+      if (touchTimer === null) return;
+      const t = e.touches[0];
+      if (Math.abs(t.clientX - touchStartX) > 10 || Math.abs(t.clientY - touchStartY) > 10) {
+        clearTouchTimer();
+      }
+    };
+    const scrollEl = scrollContainerRef.current;
+    scrollEl?.addEventListener('touchstart', handleTouchStart, { passive: true });
+    scrollEl?.addEventListener('touchmove', handleTouchMove, { passive: true });
+    scrollEl?.addEventListener('touchend', clearTouchTimer, { passive: true });
+    scrollEl?.addEventListener('touchcancel', clearTouchTimer, { passive: true });
+
     // Handle container resize - also notify server of new size
     const resizeObserver = new ResizeObserver(() => {
       updateCols();
@@ -447,6 +497,11 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
       }
       document.removeEventListener('paste', handlePasteEvent, true);
       document.removeEventListener('copy', handleCopyEvent, true);
+      clearTouchTimer();
+      scrollEl?.removeEventListener('touchstart', handleTouchStart);
+      scrollEl?.removeEventListener('touchmove', handleTouchMove);
+      scrollEl?.removeEventListener('touchend', clearTouchTimer);
+      scrollEl?.removeEventListener('touchcancel', clearTouchTimer);
       scrollContainer?.removeEventListener('wheel', handleWheelCapture, true);
       resizeObserver.disconnect();
       wsRef.current?.close();
