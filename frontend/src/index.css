@@ -208,6 +208,167 @@ input, textarea, select {
   font-size: 16px;
 }
 
+/* ============================================================= */
+/* Canvas ("Nightglass") — the alternate homepage                 */
+/* ============================================================= */
+
+@layer components {
+  .canvas-root {
+    --cv-bg: #0a0a18;
+    --cv-panel: rgba(20, 20, 42, 0.55);
+    --cv-edge: rgba(148, 163, 216, 0.14);
+    --cv-ink: #e6e9f5;
+    --cv-ink-dim: #8b91b3;
+    --cv-accent: #4fd1c5;
+    --cv-dot: rgba(148, 163, 216, 0.11);
+    background: var(--cv-bg);
+    color: var(--cv-ink);
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  .canvas-root.canvas-day {
+    --cv-bg: #e8ebf4;
+    --cv-panel: rgba(255, 255, 255, 0.62);
+    --cv-edge: rgba(28, 33, 55, 0.13);
+    --cv-ink: #1c2137;
+    --cv-ink-dim: #5a6183;
+    --cv-dot: rgba(28, 33, 55, 0.13);
+  }
+
+  /* Ambient color wash; heavier veil when a background image is set */
+  .canvas-veil {
+    pointer-events: none;
+    background:
+      radial-gradient(1200px 800px at 72% -10%, color-mix(in srgb, var(--cv-accent) 8%, transparent), transparent 60%),
+      radial-gradient(1000px 700px at 8% 110%, rgba(183, 148, 244, 0.07), transparent 60%);
+  }
+  .canvas-veil-img {
+    background: color-mix(in srgb, var(--cv-bg) 68%, transparent);
+    -webkit-backdrop-filter: blur(2px);
+    backdrop-filter: blur(2px);
+  }
+
+  .canvas-dots {
+    pointer-events: none;
+    background-image: radial-gradient(circle, var(--cv-dot) 1px, transparent 1.5px);
+    background-size: 26px 26px;
+  }
+
+  .glass {
+    background: var(--cv-panel);
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+    backdrop-filter: blur(20px) saturate(150%);
+    border: 1px solid var(--cv-edge);
+    box-shadow: 0 8px 30px rgba(4, 6, 20, 0.35);
+    border-radius: 14px;
+  }
+  .canvas-day .glass {
+    box-shadow: 0 8px 30px rgba(28, 33, 55, 0.12);
+  }
+
+  .canvas-stage { cursor: grab; }
+  .canvas-stage.canvas-dragging { cursor: grabbing; }
+  .canvas-dragging iframe { pointer-events: none; }
+
+  .tile { transition: box-shadow 0.2s ease; }
+  .tile:hover { box-shadow: 0 12px 44px rgba(4, 6, 20, 0.5); }
+  .tile-header {
+    border-bottom: 1px solid var(--cv-edge);
+    background: linear-gradient(to bottom, rgba(255, 255, 255, 0.045), transparent);
+    touch-action: none;
+    flex-shrink: 0;
+  }
+  /* Terminal screens stay dark in both themes — ANSI default colors assume it */
+  .tile-screen { background: rgba(9, 9, 22, 0.78); }
+  .canvas-day .tile-screen { background: rgba(13, 13, 26, 0.92); }
+  .tile-task {
+    color: #8b91b3;
+    background: linear-gradient(to top, rgba(9, 9, 22, 0.94) 55%, transparent);
+  }
+  .tile-btn {
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    color: var(--cv-ink-dim);
+    flex-shrink: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .tile-btn:hover { color: var(--cv-ink); background: rgba(148, 163, 216, 0.12); }
+
+  .sidebar-row:hover { background: rgba(148, 163, 216, 0.08); }
+
+  /* URLs inside session tiles — click to open an in-canvas browser window */
+  .term-link {
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .term-link:hover {
+    color: var(--cv-accent);
+    text-decoration-style: solid;
+  }
+
+  .remote-cursor { z-index: 9999; }
+
+  /* Voice orb — breathing states */
+  .voice-orb {
+    width: 42px;
+    height: 42px;
+    border-radius: 9999px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--cv-accent);
+    color: var(--cv-bg);
+    transition: box-shadow 0.3s ease, background 0.3s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .voice-orb-off {
+    background: color-mix(in srgb, var(--cv-ink-dim) 22%, transparent);
+    color: var(--cv-ink);
+    border: 1px solid var(--cv-edge);
+  }
+  .voice-orb-connecting { animation: orb-pulse 1s ease-in-out infinite; }
+  .voice-orb-idle { animation: orb-breathe 3.4s ease-in-out infinite; }
+  .voice-orb-listening {
+    animation: orb-breathe 1.3s ease-in-out infinite;
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--cv-accent) 22%, transparent);
+  }
+  .voice-orb-thinking { animation: orb-pulse 0.85s ease-in-out infinite; }
+  .voice-orb-speaking {
+    animation: orb-breathe 0.9s ease-in-out infinite;
+    box-shadow: 0 0 20px color-mix(in srgb, var(--cv-accent) 70%, transparent);
+  }
+  .voice-orb-nokey, .voice-orb-error {
+    background: color-mix(in srgb, #fc8181 55%, transparent);
+    color: #fff;
+  }
+
+  /* Spoken words get a human material: italic serif */
+  .voice-spoken {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-style: italic;
+    letter-spacing: 0.01em;
+  }
+}
+
+@keyframes orb-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.09); }
+}
+@keyframes orb-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-orb, .tile, .animate-pulse { animation: none !important; }
+  .canvas-world { transition: none !important; }
+}
+
 /* Chat markdown styles */
 .chat-markdown h1 { font-size: 1.25rem; font-weight: 700; margin: 0.75rem 0 0.5rem; color: #e2e8f0; }
 .chat-markdown h2 { font-size: 1.125rem; font-weight: 600; margin: 0.625rem 0 0.375rem; color: #e2e8f0; }

@@ -21,6 +21,7 @@ import {
   readMeta as ctxReadMeta,
   deleteMeta as ctxDeleteMeta,
   spawnAttachPty as ctxSpawnAttachPty,
+  runTmuxAsync as ctxRunTmuxAsync,
   mustFindContext,
   defaultContext,
   contextWorkspaceRoot,
@@ -48,6 +49,9 @@ import {
   sendToAll,
   listSubscriptions,
 } from './push';
+import { initCanvas, registerCanvasRoutes, canvasWss } from './canvas';
+import { registerVoiceRoutes } from './voice';
+import { registerProxyRoutes, localProxyMiddleware, handleLocalWsUpgrade } from './proxy';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -174,6 +178,29 @@ app.get('/api/contexts', (_req, res) => {
       user: c.user,
     })),
   });
+});
+
+// --- Canvas + voice ----------------------------------------------------------
+// The canvas view and voice agent work identically in coordinator and
+// single-context mode: single mode is modeled as one synthetic context so
+// canvas/voice code paths never fork.
+const ALL_CONTEXTS: Context[] = COORDINATOR_MODE && contexts
+  ? contexts.contexts
+  : [{
+      name: 'default',
+      user: null,
+      label: 'Default',
+      tmuxSocket: TMUX_SOCKET,
+      metaDir: META_DIR,
+      cwd: WORKSPACE_ROOT,
+    }];
+initCanvas(ALL_CONTEXTS);
+registerCanvasRoutes(app);
+registerProxyRoutes(app);
+registerVoiceRoutes(app, (req) => {
+  const name = (req.query.context as string) || (req.body?.context as string) || '';
+  if (!name) return ALL_CONTEXTS.find((c) => c.name === 'admin') || ALL_CONTEXTS[0];
+  return ALL_CONTEXTS.find((c) => c.name === name) || null;
 });
 
 // --- Coordinator routes (registered only when CONTEXTS_CONFIG is active) ----
@@ -1534,6 +1561,9 @@ const terminalWss = new WebSocketServer({ noServer: true });
 const chatWss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
+  // Dev-server websockets proxied under /lp/<port>/ (HMR, live sockets).
+  if (handleLocalWsUpgrade(request, socket, head)) return;
+
   const url = new URL(request.url || '', `http://${request.headers.host}`);
   const pathname = url.pathname;
 
@@ -1544,6 +1574,10 @@ server.on('upgrade', (request, socket, head) => {
   } else if (pathname === '/ws/chat') {
     chatWss.handleUpgrade(request, socket, head, (ws) => {
       chatWss.emit('connection', ws, request);
+    });
+  } else if (pathname === '/ws/canvas') {
+    canvasWss.handleUpgrade(request, socket, head, (ws) => {
+      canvasWss.emit('connection', ws, request);
     });
   } else {
     socket.destroy();
@@ -1618,6 +1652,17 @@ terminalWss.on('connection', (ws, req) => {
 
   const connectionId = `${sanitized}-${Date.now()}`;
   connections.set(connectionId, { pty, ws });
+
+  // The canvas normalizes unattached windows to a fixed size (manual mode).
+  // Unset the window-size option so sizing returns to automatic "latest
+  // client" tracking and this client's dimensions take effect. (resize-window
+  // -A is NOT this — it just sets another manual size.)
+  try {
+    const attachCtx = COORDINATOR_MODE && contexts
+      ? mustFindContext(contexts, ctxName || defaultContext(contexts).name)
+      : ALL_CONTEXTS[0];
+    void ctxRunTmuxAsync(attachCtx, ['set-option', '-w', '-t', `=${sanitized}:`, '-u', 'window-size']);
+  } catch { /* unknown context already rejected above */ }
 
   pty.onData((data) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -1709,6 +1754,11 @@ chatWss.on('connection', (ws, req) => {
     chatSession!.detachBrowser(ws);
   });
 });
+
+// Local reverse proxy (/lp/<port>/... → 127.0.0.1:<port>) — must sit after
+// every real route/static handler and before the SPA fallback so its
+// Referer-based stray-path catch never shadows the app itself.
+app.use(localProxyMiddleware());
 
 // SPA fallback - use middleware instead of wildcard route for Express 5 compatibility
 app.use((_req, res) => {

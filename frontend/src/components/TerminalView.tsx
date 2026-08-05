@@ -4,6 +4,7 @@ import ControlBar from './ControlBar';
 import FileBrowser from './FileBrowser';
 import ChatView from './ChatView.tsx';
 import { readClipboardText } from '../lib/clipboard';
+import { resolveFrameSrc } from '../lib/frameSrc';
 
 interface TerminalViewProps {
   sessionName: string;
@@ -257,7 +258,7 @@ export default function TerminalView({ sessionName, context, onBack }: TerminalV
         {activeTab === 'chat' && <ChatView sessionName={sessionName} />}
         {activeTab === 'preview' && meta.preview_url && (
           <iframe
-            src={meta.preview_url}
+            src={resolveFrameSrc(meta.preview_url)}
             className="w-full h-full border-0 bg-white"
             allow="fullscreen; clipboard-read; clipboard-write"
           />

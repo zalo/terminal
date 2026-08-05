@@ -258,3 +258,15 @@ call `tm-meta preview` whenever they launch a dev server.
 ## License
 
 MIT
+
+## Canvas homepage (voice-controlled)
+
+An alternate homepage at `/canvas` (switchable via the Sessions/Canvas tabs; choice remembered per device). Every live tmux session appears as a live tile on a pannable/zoomable canvas:
+
+- **Live tiles** stream `tmux capture-pane` snapshots over `/ws/canvas` — no PTY attach, so tiles never resize the real window. Double-click or the expand button opens a real attached terminal overlay.
+- **Callsigns**: each session gets a persistent friendly name (e.g. `casper`) for concise voice addressing, stored in `config/canvas-layout.json` along with tile/preview layout and theme (all server-persisted and multiplayer-synced).
+- **Previews**: sessions with a `tm-meta preview` URL can open an iframe tile next to their terminal.
+- **Multiplayer**: cursors, layout edits, theme changes, and voice activity broadcast to all connected clients.
+- **Voice**: requires `GROK_API_KEY` in the repo `.env`. The browser connects directly to xAI's realtime API (`grok-voice-latest`) with an ephemeral token minted by `POST /api/voice/token`. The agent can read any session (`tmux capture-pane`, secret-redacted before leaving the machine — see `server/src/redact.ts`), type into sessions, create/kill sessions, move the camera, arrange tiles, open previews, change theme/background, and goes to sleep on request.
+
+Extra endpoints: `GET /api/canvas/layout`, `GET /api/sessions/:name/screen?lines=N` (redacted unless `raw=1`), `POST /api/sessions/:name/keys` (`{text, keys[], enter}`), `POST /api/voice/token`, `WS /ws/canvas`.

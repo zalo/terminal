@@ -1,23 +1,47 @@
 import { useState, useEffect } from 'react';
 import SessionList from './components/SessionList';
 import TerminalView from './components/TerminalView';
+import CanvasView from './components/canvas/CanvasView';
 
 interface Selection {
   session: string;
   context?: string;
 }
 
-function readUrl(): Selection | null {
-  const params = new URLSearchParams(window.location.search);
-  const session = params.get('session');
-  if (!session) return null;
-  const context = params.get('context') || undefined;
-  return { session, context };
+type HomeView = 'list' | 'canvas';
+
+const HOME_VIEW_KEY = 'terminal:homeView';
+
+function savedHomeView(): HomeView {
+  try {
+    return localStorage.getItem(HOME_VIEW_KEY) === 'canvas' ? 'canvas' : 'list';
+  } catch {
+    return 'list';
+  }
 }
 
-function writeUrl(sel: Selection | null) {
+interface Route {
+  selection: Selection | null;
+  home: HomeView;
+}
+
+function readUrl(): Route {
+  const params = new URLSearchParams(window.location.search);
+  const session = params.get('session');
+  if (session) {
+    return {
+      selection: { session, context: params.get('context') || undefined },
+      home: savedHomeView(),
+    };
+  }
+  // /canvas is an explicit deep link; plain / uses the per-device preference.
+  const home = window.location.pathname === '/canvas' ? 'canvas' : savedHomeView();
+  return { selection: null, home };
+}
+
+function writeUrl(sel: Selection | null, home: HomeView) {
   if (!sel) {
-    window.history.pushState({}, '', '/');
+    window.history.pushState({}, '', home === 'canvas' ? '/canvas' : '/');
     return;
   }
   const qs = new URLSearchParams();
@@ -27,38 +51,54 @@ function writeUrl(sel: Selection | null) {
 }
 
 function App() {
-  const [selection, setSelection] = useState<Selection | null>(null);
-
-  useEffect(() => {
-    setSelection(readUrl());
-  }, []);
+  const [route, setRoute] = useState<Route>(() => readUrl());
 
   const handleSelectSession = (session: string, context?: string) => {
     const sel: Selection = { session, context };
-    setSelection(sel);
-    writeUrl(sel);
+    setRoute((r) => ({ ...r, selection: sel }));
+    writeUrl(sel, route.home);
   };
 
   const handleBack = () => {
-    setSelection(null);
-    writeUrl(null);
+    setRoute((r) => ({ ...r, selection: null }));
+    writeUrl(null, route.home);
+  };
+
+  const handleSwitchView = (home: HomeView) => {
+    try { localStorage.setItem(HOME_VIEW_KEY, home); } catch { /* private mode */ }
+    setRoute({ selection: null, home });
+    writeUrl(null, home);
   };
 
   useEffect(() => {
-    const handlePopState = () => setSelection(readUrl());
+    const handlePopState = () => setRoute(readUrl());
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  if (!selection) {
-    return <SessionList onSelectSession={handleSelectSession} />;
+  if (route.selection) {
+    return (
+      <TerminalView
+        sessionName={route.selection.session}
+        context={route.selection.context}
+        onBack={handleBack}
+      />
+    );
+  }
+
+  if (route.home === 'canvas') {
+    return (
+      <CanvasView
+        onSelectSession={handleSelectSession}
+        onSwitchView={handleSwitchView}
+      />
+    );
   }
 
   return (
-    <TerminalView
-      sessionName={selection.session}
-      context={selection.context}
-      onBack={handleBack}
+    <SessionList
+      onSelectSession={handleSelectSession}
+      onSwitchView={handleSwitchView}
     />
   );
 }

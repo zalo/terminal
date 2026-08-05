@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import NotificationToggle from './NotificationToggle';
+import HomeTabs from './HomeTabs';
 
 interface SessionMeta {
   status?: 'working' | 'waiting' | 'finished' | 'idle';
@@ -25,6 +26,7 @@ interface ContextInfo {
 
 interface SessionListProps {
   onSelectSession: (name: string, context?: string) => void;
+  onSwitchView?: (view: 'list' | 'canvas') => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -62,7 +64,7 @@ function formatTimeAgo(dateStr: string): string {
   return `${days} day${days > 1 ? 's' : ''} ago`;
 }
 
-export default function SessionList({ onSelectSession }: SessionListProps) {
+export default function SessionList({ onSelectSession, onSwitchView }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [contexts, setContexts] = useState<ContextInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -139,6 +141,11 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
   return (
     <div className="h-dvh bg-[#1a1a2e] flex flex-col items-center">
       <div className="w-full max-w-md flex flex-col flex-1 min-h-0 p-4">
+        {onSwitchView && (
+          <div className="flex justify-center mt-4 -mb-2">
+            <HomeTabs current="list" onSwitch={onSwitchView} />
+          </div>
+        )}
         <h1 className="text-2xl font-semibold text-white text-center mb-2 mt-8">
           Terminal Sessions
         </h1>
