@@ -18,6 +18,8 @@ import { request as httpRequest } from 'http';
 import type { Duplex } from 'stream';
 import dns from 'dns/promises';
 import net from 'net';
+import { Readable } from 'stream';
+import { ByteSlice, contentRange, ifRangeMatches, parseByteRange } from './range';
 
 const MAX_BYTES = 20 * 1024 * 1024;
 
@@ -69,9 +71,14 @@ function rewriteLocalHtml(html: string, port: number): string {
   return html.replace(/(\s(?:src|href|action)\s*=\s*["'])\/(?!\/|lp\/)/gi, `$1/lp/${port}/`);
 }
 
+export interface LocalProxyOptions {
+  /** When set, only ports it approves are proxied; others answer 404. */
+  allowPort?: (port: number) => boolean;
+}
+
 // Mounted late (just before the SPA fallback) so it never shadows the app's
 // own routes; /lp/* paths and referred-from-/lp/* strays both land here.
-export function localProxyMiddleware(): RequestHandler {
+export function localProxyMiddleware(opts: LocalProxyOptions = {}): RequestHandler {
   return (req, res, next) => {
     let port: number;
     let targetPath: string;
@@ -86,6 +93,9 @@ export function localProxyMiddleware(): RequestHandler {
       targetPath = req.originalUrl;
     }
     if (!(port >= 1 && port <= 65535)) return res.status(400).send('local proxy: bad port');
+    if (opts.allowPort && !opts.allowPort(port)) {
+      return res.status(404).type('text/plain').send(`local proxy: port ${port} is not shared\n`);
+    }
 
     const headers: http.OutgoingHttpHeaders = { ...req.headers, host: `127.0.0.1:${port}` };
     delete headers['accept-encoding']; // html may be rewritten — skip compression
@@ -100,38 +110,128 @@ export function localProxyMiddleware(): RequestHandler {
             !outHeaders.location.startsWith('//') && !outHeaders.location.startsWith('/lp/')) {
           outHeaders.location = `/lp/${port}${outHeaders.location}`;
         }
+        const status = ures.statusCode || 200;
         const ct = String(ures.headers['content-type'] || '');
-        if (ct.includes('text/html')) {
+        // A partial (206) HTML body is a fragment; rewriting it would be
+        // meaningless and would break Content-Range, so only whole documents
+        // get the path rewrite.
+        if (ct.includes('text/html') && status !== 206) {
           const chunks: Buffer[] = [];
           ures.on('data', (c: Buffer) => chunks.push(c));
           ures.on('end', () => {
             const html = rewriteLocalHtml(Buffer.concat(chunks).toString('utf-8'), port);
             delete outHeaders['content-length'];
             delete outHeaders['transfer-encoding'];
-            res.writeHead(ures.statusCode || 200, outHeaders);
+            delete outHeaders['content-range'];
+            res.writeHead(status, outHeaders);
             res.end(html);
           });
-        } else {
-          res.writeHead(ures.statusCode || 200, outHeaders);
-          ures.pipe(res);
+          return;
         }
+
+        // Range requests the upstream honored (206/416) pass straight
+        // through: headers and body are already correct. When the upstream
+        // ignored the Range and answered 200 with the whole resource (python
+        // -m http.server, many dev servers), satisfy the range here instead:
+        // media players — Safari/iOS in particular — refuse to play from a
+        // server that never answers 206.
+        const synth = status === 200 ? planSyntheticRange(req.headers, ures.headers) : null;
+        if (synth === 'unsatisfiable') {
+          const size = Number(ures.headers['content-length']);
+          ures.on('error', () => {});
+          ures.destroy();
+          res.writeHead(416, { 'content-range': `bytes */${size}`, 'accept-ranges': 'bytes' });
+          res.end();
+          return;
+        }
+        if (synth) {
+          const size = Number(ures.headers['content-length']);
+          const partial = {
+            ...outHeaders,
+            'content-range': contentRange(synth, size),
+            'content-length': String(synth.end - synth.start + 1),
+            'accept-ranges': 'bytes',
+          };
+          delete partial['transfer-encoding'];
+          res.writeHead(206, partial);
+          ures.on('error', () => {});
+          if (req.method === 'HEAD') {
+            ures.destroy();
+            res.end();
+            return;
+          }
+          const slice = new ByteSlice(synth.start, synth.end);
+          slice.on('sliced', () => ures.destroy()); // stop downloading the remainder
+          ures.pipe(slice).pipe(res);
+          return;
+        }
+
+        res.writeHead(status, outHeaders);
+        ures.pipe(res);
       },
     );
     upstream.on('error', () => {
       if (!res.headersSent) res.status(502).send(`local proxy: nothing listening on 127.0.0.1:${port}`);
       else res.end();
     });
-    req.pipe(upstream);
+    forwardRequestBody(req, upstream);
   };
+}
+
+// The app-wide express.json() has already drained JSON request bodies by the
+// time we run, so piping req would never end the upstream request (it hung
+// until the client gave up). Re-serialize what the parser kept; everything
+// else streams through untouched.
+function forwardRequestBody(req: Parameters<RequestHandler>[0], upstream: http.ClientRequest) {
+  if (!req.readableEnded) {
+    req.pipe(upstream);
+    return;
+  }
+  const body = req.body === undefined ? '' : JSON.stringify(req.body);
+  upstream.removeHeader('transfer-encoding');
+  upstream.setHeader('content-length', Buffer.byteLength(body));
+  upstream.end(body);
+}
+
+// Decide whether a 200 from the upstream can be turned into the 206 the
+// client asked for. Only when the upstream clearly does not do ranges
+// itself (a server that advertises `Accept-Ranges: bytes` and still sent
+// 200 is reporting an If-Range mismatch, which must stay a full response),
+// the body is unencoded so byte offsets line up, the total size is known,
+// and the client's If-Range validator (if any) still matches.
+function planSyntheticRange(
+  reqHeaders: http.IncomingHttpHeaders,
+  upHeaders: http.IncomingHttpHeaders,
+): ReturnType<typeof parseByteRange> {
+  const range = reqHeaders.range;
+  if (typeof range !== 'string') return null;
+  const acceptRanges = String(upHeaders['accept-ranges'] || '').toLowerCase();
+  if (acceptRanges && acceptRanges !== 'none') return null;
+  const encoding = String(upHeaders['content-encoding'] || 'identity').toLowerCase();
+  if (encoding !== 'identity') return null;
+  const size = Number(upHeaders['content-length']);
+  if (!Number.isFinite(size) || upHeaders['content-length'] === undefined) return null;
+  const ifRange = typeof reqHeaders['if-range'] === 'string' ? reqHeaders['if-range'] : undefined;
+  if (!ifRangeMatches(ifRange, upHeaders.etag, upHeaders['last-modified'])) return null;
+  return parseByteRange(range, size);
 }
 
 // WebSocket pass-through for /lp/<port>/... upgrades (dev-server HMR, apps
 // with live sockets). Returns true if the upgrade was handled.
-export function handleLocalWsUpgrade(request: http.IncomingMessage, socket: Duplex, head: Buffer): boolean {
+export interface LocalWsOptions extends LocalProxyOptions {
+  /** Called once an upgrade to <port> has been accepted. */
+  onAccept?: (port: number) => void;
+}
+
+export function handleLocalWsUpgrade(
+  request: http.IncomingMessage, socket: Duplex, head: Buffer, opts: LocalWsOptions = {},
+): boolean {
   const m = (request.url || '').match(LP_RE);
   if (!m) return false;
   const port = parseInt(m[1], 10);
   if (!(port >= 1 && port <= 65535)) { socket.destroy(); return true; }
+  if (opts.allowPort && !opts.allowPort(port)) { socket.destroy(); return true; }
+  opts.onAccept?.(port);
   const path = m[2] || '/';
   const upstream = net.connect(port, '127.0.0.1', () => {
     let raw = `${request.method} ${path} HTTP/1.1\r\n`;
@@ -248,15 +348,25 @@ export function registerProxyRoutes(app: Express) {
     }
 
     try {
+      const fwd: Record<string, string> = {
+        'user-agent': String(req.headers['user-agent'] || 'Mozilla/5.0 (X11; Linux x86_64) TerminalCanvas/1.0'),
+        accept: String(req.headers.accept || 'text/html,*/*'),
+        'accept-language': String(req.headers['accept-language'] || 'en'),
+      };
+      // Ranged reads (media seeking, PDF viewers) pass through verbatim.
+      // Identity encoding keeps the upstream's byte offsets meaningful.
+      if (typeof req.headers.range === 'string') {
+        fwd.range = req.headers.range;
+        fwd['accept-encoding'] = 'identity';
+        if (typeof req.headers['if-range'] === 'string') fwd['if-range'] = req.headers['if-range'];
+      }
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), 15000);
       const upstream = await fetch(target, {
         redirect: 'follow',
-        headers: {
-          'user-agent': String(req.headers['user-agent'] || 'Mozilla/5.0 (X11; Linux x86_64) TerminalCanvas/1.0'),
-          accept: String(req.headers.accept || 'text/html,*/*'),
-          'accept-language': String(req.headers['accept-language'] || 'en'),
-        },
-        signal: AbortSignal.timeout(15000),
-      });
+        headers: fwd,
+        signal: abort.signal,
+      }).finally(() => clearTimeout(timer));
 
       // Redirects may land somewhere private — re-check the final host.
       const finalUrl = new URL(upstream.url);
@@ -264,25 +374,44 @@ export function registerProxyRoutes(app: Express) {
         return res.status(403).send('proxy: redirect target refused');
       }
 
-      const len = Number(upstream.headers.get('content-length') || 0);
-      if (len > MAX_BYTES) return res.status(502).send('proxy: response too large');
-
       const contentType = upstream.headers.get('content-type') || 'text/html; charset=utf-8';
       res.status(upstream.status);
       res.setHeader('content-type', contentType);
       res.setHeader('cache-control', 'no-store');
 
-      if (contentType.includes('text/html')) {
+      // Whole HTML documents are buffered (bounded) and rewritten. Partial
+      // HTML (206) is a fragment, so it streams like any other body.
+      if (contentType.includes('text/html') && upstream.status !== 206) {
+        const len = Number(upstream.headers.get('content-length') || 0);
+        if (len > MAX_BYTES) return res.status(502).send('proxy: response too large');
         const html = await upstream.text();
         if (html.length > MAX_BYTES) return res.status(502).send('proxy: response too large');
-        res.send(rewriteHtml(html, upstream.url));
-      } else {
-        const buf = Buffer.from(await upstream.arrayBuffer());
-        if (buf.length > MAX_BYTES) return res.status(502).send('proxy: response too large');
-        res.send(buf);
+        return res.send(rewriteHtml(html, upstream.url));
       }
+
+      // Everything else streams through so large media is never held in
+      // memory; range metadata is relayed so clients can seek.
+      for (const h of ['content-range', 'accept-ranges', 'etag', 'last-modified', 'content-disposition']) {
+        const v = upstream.headers.get(h);
+        if (v) res.setHeader(h, v);
+      }
+      // fetch() transparently decodes compressed bodies, so the upstream
+      // Content-Length is only truthful for identity-encoded responses.
+      const enc = (upstream.headers.get('content-encoding') || 'identity').toLowerCase();
+      const len = upstream.headers.get('content-length');
+      if (enc === 'identity' && len) res.setHeader('content-length', len);
+
+      if (!upstream.body || req.method === 'HEAD') {
+        try { await upstream.body?.cancel(); } catch { /* ignore */ }
+        return res.end();
+      }
+      const body = Readable.fromWeb(upstream.body as import('stream/web').ReadableStream);
+      res.on('close', () => { if (!body.readableEnded) body.destroy(); });
+      body.on('error', () => { if (!res.headersSent) res.status(502); res.end(); });
+      body.pipe(res);
     } catch (e) {
-      res.status(502).send(`proxy: fetch failed (${(e as Error).name})`);
+      if (!res.headersSent) res.status(502).send(`proxy: fetch failed (${(e as Error).name})`);
+      else res.end();
     }
   });
 }

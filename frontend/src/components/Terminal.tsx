@@ -4,6 +4,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { copyText } from '../lib/clipboard';
 import { MultilineUrlProvider } from '../lib/multilineLinks';
+import { unwrapSelection, sourceLinesFromText, type SourceLine } from '../lib/unwrap';
+import { openExternal } from '../lib/openExternal';
 
 interface TerminalProps {
   sessionName: string;
@@ -23,6 +25,83 @@ interface TerminalProps {
 
 const TERMINAL_ROWS = 200; // Tall terminal for scrollback history
 
+// Copies re-join lines the TUI wrapped to the pane width (long URLs/commands
+// come out as one line). Persisted; toggled from the select overlay's bar.
+const UNWRAP_COPY_KEY = 'terminal.unwrapCopy';
+function loadUnwrapCopy(): boolean {
+  try { return localStorage.getItem(UNWRAP_COPY_KEY) !== '0'; } catch { return true; }
+}
+
+// Right-edge column of a buffer row: index just past the last non-blank cell.
+function rowEdge(terminal: XTerm, row: number): number {
+  const line = terminal.buffer.active.getLine(row);
+  if (!line) return 0;
+  const cell = terminal.buffer.active.getNullCell();
+  for (let col = line.length - 1; col >= 0; col--) {
+    const c = line.getCell(col, cell);
+    if (!c) continue;
+    const chars = c.getChars();
+    if (chars && chars.trim()) return col + Math.max(1, c.getWidth());
+  }
+  return 0;
+}
+
+// xterm's selection text with wrapped fragments re-joined. Falls back to the
+// raw selection when the buffer range can't be mapped onto it.
+function getSelectionUnwrapped(terminal: XTerm): string {
+  const raw = terminal.getSelection();
+  const pieces = raw.split('\n');
+  const pos = terminal.getSelectionPosition();
+  if (pieces.length < 2 || !pos) return raw;
+  const buffer = terminal.buffer.active;
+  const lines: SourceLine[] = [];
+  let row = pos.start.y;
+  while (lines.length < pieces.length && row < buffer.length) {
+    // One logical line: xterm joins soft-wrapped rows in getSelection() too.
+    let text = '';
+    let edge = 0;
+    for (;;) {
+      const line = buffer.getLine(row);
+      if (!line) break;
+      text += line.translateToString(true);
+      edge = rowEdge(terminal, row);
+      row++;
+      const next = buffer.getLine(row);
+      if (!next || !next.isWrapped) break;
+    }
+    lines.push({ text: text.trimEnd(), edge });
+  }
+  return unwrapSelection(pieces, lines, terminal.cols);
+}
+
+// Reveal the cursor by scrolling the outer container. Scroll overrides are only
+// ever applied downward: if the cursor is already visible, or revealing it would
+// mean scrolling up, the user's position is left alone (a viewport refresh /
+// keyboard toggle used to yank the view upward mid-typing because of a rough
+// 17px row estimate that drifted from xterm's real cell height).
+function scrollDownToCursor(container: HTMLElement, terminal: XTerm, onlyIfHidden: boolean) {
+  const screen = container.querySelector<HTMLElement>('.xterm-screen');
+  const measured = screen && terminal.rows > 0 ? screen.offsetHeight / terminal.rows : 0;
+  const rowHeight = measured > 0 ? measured : 17;
+
+  const cursorRow = terminal.buffer.active.baseY + terminal.buffer.active.cursorY;
+  const cursorPixelPosition = cursorRow * rowHeight;
+  const scrollTop = container.scrollTop;
+  const containerHeight = container.clientHeight;
+
+  if (onlyIfHidden) {
+    const cursorVisible = cursorPixelPosition >= scrollTop &&
+                          cursorPixelPosition + rowHeight <= scrollTop + containerHeight;
+    if (cursorVisible) return;
+  }
+
+  // Show cursor well above the bottom of the visible area (extra 200px for keyboard)
+  const targetScroll = Math.max(0, cursorPixelPosition - containerHeight + rowHeight * 3 + 200);
+  if (targetScroll > scrollTop) {
+    container.scrollTop = targetScroll;
+  }
+}
+
 export default function Terminal({ sessionName, context, onReady, onConnectionChange }: TerminalProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -37,8 +116,48 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(true);
   const [selectText, setSelectText] = useState<string | null>(null);
+  const selectTextRef = useRef<string | null>(null);
+  selectTextRef.current = selectText;
   const [copiedAll, setCopiedAll] = useState(false);
   const overlayScrollRef = useRef<HTMLDivElement>(null);
+  const [unwrapCopy, setUnwrapCopy] = useState<boolean>(loadUnwrapCopy);
+  const unwrapCopyRef = useRef(unwrapCopy);
+  unwrapCopyRef.current = unwrapCopy;
+
+  const toggleUnwrapCopy = useCallback(() => {
+    setUnwrapCopy((v) => {
+      try { localStorage.setItem(UNWRAP_COPY_KEY, v ? '0' : '1'); } catch { /* ignore */ }
+      return !v;
+    });
+  }, []);
+
+  // Text of the native selection inside the select overlay, unwrapped when
+  // enabled. Null when the selection isn't inside the overlay.
+  const getOverlaySelection = useCallback((): string | null => {
+    const pre = overlayScrollRef.current?.querySelector('pre');
+    const sel = window.getSelection();
+    const all = selectTextRef.current;
+    if (!pre || !sel || sel.rangeCount === 0 || sel.isCollapsed || all === null) return null;
+    const range = sel.getRangeAt(0);
+    if (!pre.contains(range.commonAncestorContainer)) return null;
+    const raw = sel.toString();
+    if (!unwrapCopyRef.current) return raw;
+    const pieces = raw.split('\n');
+    if (pieces.length < 2) return raw;
+    // Locate the selection start within the overlay text to find its line
+    const before = range.cloneRange();
+    before.selectNodeContents(pre);
+    before.setEnd(range.startContainer, range.startOffset);
+    const startIdx = before.toString().length;
+    const allLines = all.split('\n');
+    let lineIdx = 0;
+    for (let consumed = 0; lineIdx < allLines.length - 1; lineIdx++) {
+      consumed += allLines[lineIdx].length + 1;
+      if (consumed > startIdx) break;
+    }
+    const lines = sourceLinesFromText(allLines.slice(lineIdx, lineIdx + pieces.length));
+    return unwrapSelection(pieces, lines, terminalRef.current?.cols ?? 80);
+  }, []);
 
   // Notify parent of connection state changes
   useEffect(() => {
@@ -64,7 +183,8 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
   }, []);
 
   const copySelection = useCallback(async () => {
-    const selection = terminalRef.current?.getSelection();
+    const term = terminalRef.current;
+    const selection = term ? (unwrapCopyRef.current ? getSelectionUnwrapped(term) : term.getSelection()) : '';
     if (selection) {
       const ok = await copyText(selection);
       if (!ok) console.error('Failed to copy selection');
@@ -101,11 +221,17 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
   }, []);
 
   const handleCopyAll = useCallback(async () => {
-    if (selectText && (await copyText(selectText))) {
+    if (!selectText) return;
+    let text = selectText;
+    if (unwrapCopy) {
+      const lines = selectText.split('\n');
+      text = unwrapSelection(lines, sourceLinesFromText(lines), terminalRef.current?.cols ?? 80);
+    }
+    if (await copyText(text)) {
       setCopiedAll(true);
       setTimeout(() => setCopiedAll(false), 1500);
     }
-  }, [selectText]);
+  }, [selectText, unwrapCopy]);
 
   // Mirror the terminal's scroll position when the overlay opens
   useEffect(() => {
@@ -155,30 +281,9 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
     if (manualScrollRef.current) return;
 
     if (scrollContainerRef.current && terminalRef.current && viewportHeight !== null) {
-      const container = scrollContainerRef.current;
-      const terminal = terminalRef.current;
-
-      // Get cursor position in the terminal buffer
-      const cursorY = terminal.buffer.active.cursorY;
-      const baseY = terminal.buffer.active.baseY;
-      const cursorRow = baseY + cursorY;
-
-      // Calculate row height (font size 14px * ~1.2 line height)
-      const rowHeight = 17;
-      const cursorPixelPosition = cursorRow * rowHeight;
-
-      // Check if cursor is currently visible
-      const scrollTop = container.scrollTop;
-      const containerHeight = container.clientHeight;
-      const cursorVisible = cursorPixelPosition >= scrollTop &&
-                           cursorPixelPosition < scrollTop + containerHeight - rowHeight;
-
-      // Only scroll if cursor is not visible (e.g., keyboard pushed it off screen)
-      if (!cursorVisible) {
-        // Scroll to show cursor well above the bottom of visible area (extra 200px for keyboard)
-        const targetScroll = Math.max(0, cursorPixelPosition - containerHeight + rowHeight * 3 + 200);
-        container.scrollTop = targetScroll;
-      }
+      // Only scroll if the cursor is hidden (e.g. keyboard pushed it off screen),
+      // and never upward.
+      scrollDownToCursor(scrollContainerRef.current, terminalRef.current, true);
     }
   }, [viewportHeight]);
 
@@ -295,9 +400,7 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
     // Linkify URLs, joining URLs hard-wrapped across lines (Claude Code
     // indents and wraps long ones) into a single clickable link
     terminal.registerLinkProvider(
-      new MultilineUrlProvider(terminal, (uri) => {
-        window.open(uri, '_blank', 'noopener,noreferrer');
-      })
+      new MultilineUrlProvider(terminal, openExternal)
     );
 
     // Open terminal in container
@@ -314,7 +417,7 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
       if (mod && e.code === 'KeyV') return false;
       if (mod && e.code === 'KeyC') {
         if (terminal.hasSelection()) {
-          copyText(terminal.getSelection());
+          copyText(unwrapCopyRef.current ? getSelectionUnwrapped(terminal) : terminal.getSelection());
           terminal.clearSelection();
           return false;
         }
@@ -416,9 +519,18 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
     // Document-level copy: covers Edit-menu / context-menu copy while an
     // xterm selection is active (there's no DOM selection to copy natively)
     const handleCopyEvent = (e: ClipboardEvent) => {
+      if (!e.clipboardData) return;
+      // Native selection inside the select overlay (mobile long-press flow)
+      const overlayText = getOverlaySelection();
+      if (overlayText !== null) {
+        e.clipboardData.setData('text/plain', overlayText);
+        e.preventDefault();
+        return;
+      }
       if (isForeignTarget(e.target)) return;
-      if (terminal.hasSelection() && e.clipboardData) {
-        e.clipboardData.setData('text/plain', terminal.getSelection());
+      if (terminal.hasSelection()) {
+        const text = unwrapCopyRef.current ? getSelectionUnwrapped(terminal) : terminal.getSelection();
+        e.clipboardData.setData('text/plain', text);
         e.preventDefault();
       }
     };
@@ -479,15 +591,7 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
 
     // Scroll to cursor position initially
     if (scrollContainerRef.current) {
-      const container = scrollContainerRef.current;
-      const rowHeight = 17;
-      const cursorY = terminal.buffer.active.cursorY;
-      const baseY = terminal.buffer.active.baseY;
-      const cursorRow = baseY + cursorY;
-      const cursorPixelPosition = cursorRow * rowHeight;
-      const containerHeight = container.clientHeight;
-      const targetScroll = Math.max(0, cursorPixelPosition - containerHeight + rowHeight * 3 + 200);
-      container.scrollTop = targetScroll;
+      scrollDownToCursor(scrollContainerRef.current, terminal, false);
     }
 
     return () => {
@@ -508,7 +612,7 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
       webglAddonRef.current?.dispose();
       terminal.dispose();
     };
-  }, [sessionName, onReady, connectWebSocket, sendInput, paste, focus, copySelection, hasSelection, enterSelectMode, scrollUp, scrollDown]);
+  }, [sessionName, onReady, connectWebSocket, sendInput, paste, focus, copySelection, hasSelection, enterSelectMode, scrollUp, scrollDown, getOverlaySelection]);
 
   // Calculate container height based on viewport
   const containerStyle: React.CSSProperties = viewportHeight
@@ -530,6 +634,13 @@ export default function Terminal({ sessionName, context, onReady, onConnectionCh
         <div className="select-overlay">
           <div className="select-overlay-bar">
             <span className="select-overlay-hint">Select text to copy</span>
+            <button
+              className={`control-btn px-3${unwrapCopy ? ' active' : ''}`}
+              onClick={toggleUnwrapCopy}
+              title="Re-join lines that were wrapped to the terminal width when copying"
+            >
+              {unwrapCopy ? 'Unwrap ✓' : 'Unwrap'}
+            </button>
             <button className="control-btn px-3" onClick={handleCopyAll}>
               {copiedAll ? 'Copied ✓' : 'Copy all'}
             </button>

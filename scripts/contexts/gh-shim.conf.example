@@ -1,0 +1,24 @@
+# /etc/terminal/gh-shim.conf — policy for the terminal gh shim (/usr/local/bin/gh).
+#
+# Sourced by the shim as bash. Installed from
+# scripts/contexts/gh-shim.conf.example by scripts/contexts/gh-shim.sh only if
+# absent — edit the /etc copy directly, it is never clobbered.
+#
+# REQUIRED: replace the placeholder values of BLOCKED_ORGS and ALLOWED_OWNER
+# below. `gh-shim.sh install` and `status` warn while any `your-…`
+# placeholder is still present.
+#
+# Linux users whose `gh` calls are policed (everyone else passes straight
+# through to /usr/bin/gh). Each listed user is expected to hold a fine-grained
+# PAT scoped to ALLOWED_OWNER in ~/.config/gh/hosts.yml — that token is the
+# real boundary; the shim is defense-in-depth on top of it.
+RESTRICTED_USERS=(agent-untrusted agent-john)
+
+# GitHub orgs/owners that restricted users must never reference on the
+# command line (repo slugs, URLs, --owner/--org values, search qualifiers).
+# Example: BLOCKED_ORGS=(my-employer my-other-org)
+BLOCKED_ORGS=(your-blocked-org)
+
+# The single GitHub account the restricted users' tokens are scoped to.
+# Only used in error/help text. Example: ALLOWED_OWNER="my-github-username"
+ALLOWED_OWNER="your-github-account"

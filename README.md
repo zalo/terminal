@@ -249,6 +249,34 @@ call `tm-meta preview` whenever they launch a dev server.
 | GET | `/api/files/content?path=...` | Get file content |
 | WS | `/ws/terminal?session=...` | Terminal WebSocket |
 
+## Public sharing (time-limited)
+
+Localhost dev servers viewed through the canvas run through the local reverse
+proxy (`/lp/<port>/`), which is only reachable through the Access-protected
+app. A **share grant** additionally exposes one port on a separate public
+hostname with no login in front of it:
+
+- **Default off**: a port with no grant answers 404 on the share host.
+- **Time-limited**: every grant has an absolute expiry (default 60 min, max
+  `SHARE_MAX_MINUTES`, default 1440). Expired grants are swept and any live
+  websocket through them is cut.
+- **Owner-only control**: grants are created from the main app (globe button
+  on browser/preview tiles that point at localhost) or with
+  `scripts/bin/tm-share <port> [--minutes N]` over the admin socket.
+
+The server starts a second listener for this, `TERMINAL_SHARE_SOCKET`
+(default `$XDG_RUNTIME_DIR/terminal-share.sock`; `TERMINAL_SHARE_PORT` for a
+TCP port in dev). It mounts nothing but the gated proxy. Point a separate
+tunnel hostname at it and set `TERMINAL_SHARE_ORIGIN` to that public origin,
+e.g. in cloudflared's ingress:
+
+```yaml
+  - hostname: share.example.com
+    service: unix:/run/user/1000/terminal-share.sock
+```
+
+Grants persist in `config/shares.json` across server restarts.
+
 ## Tech Stack
 
 - **Frontend**: React, TypeScript, Vite, Tailwind CSS, xterm.js

@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""tm-restore: rebuild tmux sessions recorded by tm-snapshot and resume the
+Claude Code session that was running in each pane.
+
+For every context in the snapshot: sessions that already exist on the socket
+are left alone; missing ones are recreated with the same windows and pane
+cwds (layout is not preserved), seeded with the same env the terminal server
+sets (CLAUDE_META_DIR, TMUX_SOCKET). Panes that had a Claude session get
+`claude --resume <id> <original flags>` sent to them.
+
+Runs from terminal-server.service's ExecStartPre, i.e. at boot AND after any
+crash/OOM-kill/restart of the server (sessions that still exist are skipped,
+so a routine restart is a no-op). Picks sessions.json, but falls back to
+sessions.last-good.json when sessions.json holds no sessions at all and was
+not vetted by tm-snapshot (written before its re-check / empty-confirmation
+guards existed, or by something else). A vetted empty snapshot means the user
+really closed everything, so it is honored. (The unit's Result can't be used
+for this: systemd resets it to "success" before ExecStartPre of the automatic
+restart runs.) `--from FILE` overrides.
+
+Env:
+  TERMINAL_RESTORE_AUTORUN=0  type the resume command but don't press Enter
+  TERMINAL_RESTORE_DRY_RUN=1  print what would happen, touch nothing
+  TERMINAL_STATE_DIR          where sessions.json lives (default ~/.local/state/terminal)
+
+Always writes the per-boot marker ($XDG_RUNTIME_DIR/terminal-restore.done) on
+exit so tm-snapshot knows it is safe to start overwriting the snapshot.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("TERMINAL_STATE_DIR", HOME / ".local/state/terminal"))
+SNAPSHOT = Path(os.environ.get("TERMINAL_SNAPSHOT", STATE_DIR / "sessions.json"))
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+RESTORE_MARKER = Path(os.environ.get("TERMINAL_RESTORE_MARKER", RUNTIME_DIR / "terminal-restore.done"))
+AUTORUN = os.environ.get("TERMINAL_RESTORE_AUTORUN", "1") != "0"
+DRY = os.environ.get("TERMINAL_RESTORE_DRY_RUN") == "1"
+LAST_GOOD = STATE_DIR / "sessions.last-good.json"
+
+
+def log(msg):
+    print(f"[tm-restore] {msg}", file=sys.stderr)
+
+
+def as_user(ctx, argv):
+    if ctx.get("user"):
+        return ["sudo", "-n", "-u", ctx["user"], "--", *argv]
+    return argv
+
+
+def tmux(ctx, *args, check=True):
+    argv = as_user(ctx, ["tmux", "-S", ctx["tmuxSocket"], *args])
+    if DRY:
+        log("  $ " + " ".join(shlex.quote(a) for a in argv))
+        return 0, ""
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"tmux {' '.join(args[:2])} failed: {r.stderr.strip()}")
+    return r.returncode, r.stdout
+
+
+def session_exists(ctx, name):
+    if DRY:
+        return False
+    code, _ = tmux(ctx, "has-session", "-t", f"={name}", check=False)
+    return code == 0
+
+
+def dir_ok(ctx, path):
+    """Can the context user cd into path? (admin: plain check; peers: via sudo)"""
+    if not path:
+        return False
+    if not ctx.get("user"):
+        return os.path.isdir(path)
+    r = subprocess.run(as_user(ctx, ["test", "-d", path]), capture_output=True)
+    return r.returncode == 0
+
+
+def pick_cwd(ctx, want):
+    for cand in (want, ctx.get("defaultCwd"), f'/home/{ctx["user"]}' if ctx.get("user") else str(HOME)):
+        if dir_ok(ctx, cand):
+            return cand
+    return "/"
+
+
+def env_args(ctx):
+    out = []
+    if ctx.get("metaDir"):
+        out += ["-e", f'CLAUDE_META_DIR={ctx["metaDir"]}']
+    out += ["-e", f'TMUX_SOCKET={ctx["tmuxSocket"]}']
+    return out
+
+
+def resume_cmd(claude):
+    sid = claude.get("session_id")
+    if not sid:
+        return None
+    parts = ["claude", "--resume", sid, *claude.get("flags", [])]
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def restore_session(ctx, sess):
+    name = sess["name"]
+    if session_exists(ctx, name):
+        log(f"[{ctx['name']}] {name}: already exists, skipping")
+        return 0
+    windows = sess.get("windows") or []
+    if not windows:
+        return 0
+    resumes = []  # (target, cmd)
+    first = True
+    for w in windows:
+        panes = w.get("panes") or [{"cwd": None}]
+        lead = panes[0]
+        cwd = pick_cwd(ctx, lead.get("cwd"))
+        if first:
+            tmux(ctx, "new-session", "-d", "-s", name, "-c", cwd, *env_args(ctx))
+            first = False
+        else:
+            tmux(ctx, "new-window", "-d", "-t", f"={name}:", "-c", cwd)
+        # window target by index after creation: use the last window
+        _, out = tmux(ctx, "list-windows", "-t", f"={name}", "-F", "#{window_id}", check=False)
+        wid = (out.strip().splitlines() or ["@?"])[-1]
+        _, out = tmux(ctx, "list-panes", "-t", f"={name}:{wid}", "-F", "#{pane_id}", check=False)
+        pane_ids = out.strip().splitlines() or ["%?"]
+        if lead.get("claude"):
+            cmd = resume_cmd(lead["claude"])
+            if cmd and (cwd == lead["claude"].get("cwd") or cwd == lead.get("cwd")):
+                resumes.append((f"{pane_ids[0]}", cmd))
+            elif cmd:
+                log(f"[{ctx['name']}] {name}:{w['index']} cwd {lead.get('cwd')} gone; not resuming {lead['claude']['session_id']}")
+        for p in panes[1:]:
+            pcwd = pick_cwd(ctx, p.get("cwd"))
+            tmux(ctx, "split-window", "-d", "-t", f"={name}:{wid}", "-c", pcwd)
+            _, out = tmux(ctx, "list-panes", "-t", f"={name}:{wid}", "-F", "#{pane_id}", check=False)
+            new_ids = [i for i in out.strip().splitlines() if i not in pane_ids]
+            pane_ids = out.strip().splitlines()
+            if p.get("claude") and new_ids:
+                cmd = resume_cmd(p["claude"])
+                if cmd and pcwd == p.get("cwd"):
+                    resumes.append((new_ids[-1], cmd))
+        if len(panes) > 1:
+            tmux(ctx, "select-layout", "-t", f"={name}:{wid}", "tiled", check=False)
+    # Re-select the window that was active.
+    for w in windows:
+        if w.get("active"):
+            tmux(ctx, "select-window", "-t", f"={name}:{w['index']}", check=False)
+    # Send resume commands after all panes exist so shells have had a moment.
+    for target, cmd in resumes:
+        if AUTORUN:
+            tmux(ctx, "send-keys", "-t", target, cmd, "Enter")
+        else:
+            tmux(ctx, "send-keys", "-t", target, cmd)
+    log(f"[{ctx['name']}] {name}: {len(windows)} window(s), {len(resumes)} claude resume(s){' typed only' if not AUTORUN else ''}")
+    return len(resumes)
+
+
+def count_sessions(doc):
+    return sum(len(c.get("sessions") or []) for c in doc.get("contexts", []))
+
+
+def choose_snapshot(argv):
+    if "--from" in argv:
+        return Path(argv[argv.index("--from") + 1]), "explicit"
+    if not SNAPSHOT.exists():
+        return (LAST_GOOD, "last-good (no sessions.json)") if LAST_GOOD.exists() else (SNAPSHOT, "none")
+    try:
+        doc = json.loads(SNAPSHOT.read_text())
+        if count_sessions(doc) == 0 and not doc.get("vetted") and LAST_GOOD.exists():
+            return LAST_GOOD, "last-good (sessions.json empty and unvetted)"
+    except Exception:
+        pass
+    return SNAPSHOT, "current"
+
+
+def main():
+    try:
+        src, why = choose_snapshot(sys.argv[1:])
+        if not src.exists():
+            log(f"no snapshot at {src}; nothing to restore")
+            return 0
+        doc = json.loads(src.read_text())
+        age = int(time.time()) - int(doc.get("taken_at", 0))
+        log(f"snapshot {src} [{why}] taken {age}s ago{' (DRY RUN)' if DRY else ''}")
+        n_sess = n_res = 0
+        for ctx in doc.get("contexts", []):
+            if not ctx.get("sessions"):
+                continue
+            # tmux unlinks a stale socket itself on new-session; peers run via sudo.
+            for sess in ctx["sessions"]:
+                try:
+                    n_res += restore_session(ctx, sess)
+                    n_sess += 1
+                except Exception as e:
+                    log(f"[{ctx['name']}] {sess.get('name')}: FAILED: {e}")
+        log(f"done: {n_sess} session(s) processed, {n_res} claude resume(s)")
+        return 0
+    finally:
+        if not DRY:
+            try:
+                RESTORE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                RESTORE_MARKER.write_text(str(int(time.time())))
+            except OSError as e:
+                log(f"could not write marker {RESTORE_MARKER}: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""tm-share: make a local port publicly reachable for a limited time.
+
+The terminal server's share listener exposes /lp/<port>/ on a public
+hostname (TERMINAL_SHARE_ORIGIN, e.g. https://share.example.com) with no
+login in front of it — but only for ports with a live grant. Grants are off
+by default and always expire.
+
+Usage:
+  tm-share <port> [--minutes N] [--label TEXT]   share (or renew) a port
+  tm-share ls                                    list active shares
+  tm-share off <port>                            stop sharing a port
+
+Talks to the owner-only admin socket ($TERMINAL_SOCKET, default
+$XDG_RUNTIME_DIR/terminal-server.sock), so it only works as the user that
+runs terminal-server.
+"""
+import argparse
+import http.client
+import json
+import os
+import socket
+import sys
+import time
+
+
+def sock_path() -> str:
+    return os.environ.get("TERMINAL_SOCKET") or os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "terminal-server.sock")
+
+
+class UnixConn(http.client.HTTPConnection):
+    def __init__(self, path: str):
+        super().__init__("terminal-server", timeout=10)
+        self._path = path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._path)
+        self.sock = s
+
+
+def call(method: str, path: str, body=None):
+    conn = UnixConn(sock_path())
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    try:
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        payload = resp.read().decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException) as e:
+        sys.stderr.write(f"tm-share: cannot reach terminal-server at {sock_path()}: {e}\n")
+        sys.exit(1)
+    try:
+        parsed = json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        parsed = {"error": payload.strip()}
+    if resp.status >= 400:
+        sys.stderr.write(f"tm-share: HTTP {resp.status}: {parsed.get('error', payload.strip())}\n")
+        sys.exit(1)
+    return parsed
+
+
+def fmt_remaining(expires_ms: int) -> str:
+    m = max(0, int((expires_ms - time.time() * 1000) / 60000 + 0.999))
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m" if h < 24 else f"{h // 24}d {h % 24}h"
+
+
+def print_share(s: dict):
+    url = s.get("url") or f"/lp/{s['port']}/"
+    label = f"  ({s['label']})" if s.get("label") else ""
+    print(f"{url}  port {s['port']}  expires in {fmt_remaining(s['expiresAt'])}{label}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="tm-share", description=__doc__.split("\n\n")[0])
+    ap.add_argument("target", help="port number, 'ls', or 'off'")
+    ap.add_argument("port", nargs="?", help="port (with 'off')")
+    ap.add_argument("--minutes", type=float, default=None, help="how long the port stays public (default: server default, usually 60)")
+    ap.add_argument("--label", default=None, help="note shown in listings")
+    args = ap.parse_args()
+
+    if args.target == "ls":
+        state = call("GET", "/api/share")
+        shares = state.get("shares", [])
+        if not shares:
+            print("no active shares")
+            return 0
+        for s in shares:
+            print_share(s)
+        return 0
+
+    if args.target == "off":
+        if not args.port:
+            ap.error("off needs a port")
+        r = call("DELETE", f"/api/share/{int(args.port)}")
+        print("stopped" if r.get("revoked") else "was not shared")
+        return 0
+
+    try:
+        port = int(args.target)
+    except ValueError:
+        ap.error("first argument must be a port number, 'ls' or 'off'")
+    body = {"port": port}
+    if args.minutes is not None:
+        body["minutes"] = args.minutes
+    if args.label:
+        body["label"] = args.label
+    print_share(call("POST", "/api/share", body))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

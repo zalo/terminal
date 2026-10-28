@@ -6,6 +6,9 @@ interface FileEntry {
   type: 'file' | 'directory';
   size: number | null;
   modified: string;
+  symlink?: boolean;
+  target?: string;
+  broken?: boolean;
 }
 
 interface DirectoryListing {
@@ -142,6 +145,7 @@ export default function FileBrowser({ sessionCwd, context }: FileBrowserProps = 
   }, [error]);
 
   const handleNavigate = (entry: FileEntry) => {
+    if (entry.broken) return;
     if (entry.type === 'directory') {
       fetchDirectory(`${currentPath}/${entry.name}`);
     } else {
@@ -582,7 +586,8 @@ export default function FileBrowser({ sessionCwd, context }: FileBrowserProps = 
                       draggable
                       onDragStart={(e) => handleDragStart(e, entry)}
                       onDragEnd={handleDragEnd}
-                      className="cursor-grab active:cursor-grabbing touch-none flex-shrink-0"
+                      className="relative cursor-grab active:cursor-grabbing touch-none flex-shrink-0"
+                      title={entry.symlink ? `→ ${entry.target ?? '?'}${entry.broken ? ' (broken)' : ''}` : undefined}
                     >
                       {entry.type === 'directory' ? (
                         <svg className="w-5 h-5 text-[#4fd1c5]" fill="currentColor" viewBox="0 0 20 20">
@@ -597,22 +602,30 @@ export default function FileBrowser({ sessionCwd, context }: FileBrowserProps = 
                           />
                         </svg>
                       )}
+                      {entry.symlink && (
+                        <svg className={`absolute -bottom-1 -right-1 w-3 h-3 rounded-sm bg-[#1a1a2e] ${entry.broken ? 'text-red-400' : 'text-amber-300'}`} fill="none" stroke="currentColor" strokeWidth={3} viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M7 17L17 7M9 7h8v8" />
+                        </svg>
+                      )}
                     </div>
                     {/* Clickable name + size */}
                     <button
                       onClick={() => handleNavigate(entry)}
                       className="flex-1 flex items-center gap-3 min-w-0 text-left"
                     >
-                      <span className="flex-1 text-white truncate">
+                      <span className={`flex-1 truncate ${entry.broken ? 'text-slate-500 line-through' : 'text-white'}`}>
                         {entry.name}
                         {entry.type === 'directory' && '/'}
+                        {entry.symlink && (
+                          <span className="ml-2 text-xs text-slate-500 no-underline">→ {entry.target}</span>
+                        )}
                       </span>
                       <span className="text-slate-500 text-sm whitespace-nowrap">
                         {entry.type === 'file' && entry.size !== null
                           ? formatSize(entry.size)
                           : entry.type === 'directory' && dirSizes[entry.name] !== undefined
                             ? formatSize(dirSizes[entry.name])
-                            : entry.type === 'directory' ? '\u00B7\u00B7\u00B7' : ''}
+                            : entry.type === 'directory' && !entry.symlink ? '\u00B7\u00B7\u00B7' : ''}
                       </span>
                     </button>
                   </div>

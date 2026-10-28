@@ -64,32 +64,56 @@ export async function getPushState(): Promise<PushState> {
   if (Notification.permission === 'denied') return { status: 'denied' };
   const reg = await registerServiceWorker();
   if (!reg) return { status: 'unsupported', reason: 'Service worker registration failed' };
-  const sub = await reg.pushManager.getSubscription();
-  if (sub) return { status: 'subscribed', endpoint: sub.endpoint };
-  return { status: 'unsubscribed' };
+  return reconcileSubscription(reg);
 }
 
-export async function subscribeUserToPush(label?: string): Promise<PushState> {
-  const reg = await registerServiceWorker();
-  if (!reg) return { status: 'unsupported', reason: 'Service worker registration failed' };
-
-  const permission = await Notification.requestPermission();
-  if (permission !== 'granted') return { status: 'denied' };
-
-  const existing = await reg.pushManager.getSubscription();
-  let sub = existing;
-  if (!sub) {
+// Make the browser's subscription and the server's record agree.
+//
+// The server regenerates its VAPID keys on a fresh install (this happened on
+// the Ubuntu -> Omarchy move) and its subscription store is on disk, not in the
+// browser. The PWA's old subscription survives both, so the bell showed "on"
+// while the server had zero devices and every tm-notify went nowhere. Here:
+//   - a subscription bound to a different server key is dropped and recreated
+//   - any live subscription is (re)registered with the server, idempotently
+//   - if permission is already granted, a missing subscription is recreated
+//     without needing another tap
+async function reconcileSubscription(reg: ServiceWorkerRegistration): Promise<PushState> {
+  let serverKey: string | null = null;
+  try {
     const res = await fetch('/api/push/vapid-public-key');
-    const { publicKey } = await res.json();
-    sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      // Cast: TS's BufferSource requires Uint8Array<ArrayBuffer> (not
-      // ArrayBufferLike). Our helper already returns ArrayBuffer-backed
-      // bytes, so this is a narrowing assertion.
-      applicationServerKey: urlBase64ToUint8Array(publicKey) as unknown as BufferSource,
-    });
+    serverKey = (await res.json()).publicKey ?? null;
+  } catch {
+    // offline / server down: fall back to reporting local state only
   }
 
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && serverKey && !keyMatches(sub, serverKey)) {
+    try { await sub.unsubscribe(); } catch { /* ignore */ }
+    sub = null;
+  }
+  if (!sub && serverKey && Notification.permission === 'granted') {
+    try {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(serverKey) as unknown as BufferSource,
+      });
+    } catch (e) {
+      console.error('push resubscribe failed:', e);
+    }
+  }
+  if (!sub) return { status: 'unsubscribed' };
+  if (serverKey) await registerWithServer(sub, navigator.userAgent.slice(0, 80));
+  return { status: 'subscribed', endpoint: sub.endpoint };
+}
+
+function keyMatches(sub: PushSubscription, serverKey: string): boolean {
+  const local = sub.options?.applicationServerKey;
+  if (!local) return true; // can't tell; assume fine
+  return arrayBufferToBase64(local as ArrayBuffer).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    === serverKey.replace(/=+$/, '');
+}
+
+async function registerWithServer(sub: PushSubscription, label?: string): Promise<void> {
   const subJson = sub.toJSON() as { keys?: { p256dh?: string; auth?: string } };
   await fetch('/api/push/subscribe', {
     method: 'POST',
@@ -103,6 +127,33 @@ export async function subscribeUserToPush(label?: string): Promise<PushState> {
       label,
     }),
   });
+}
+
+export async function subscribeUserToPush(label?: string): Promise<PushState> {
+  const reg = await registerServiceWorker();
+  if (!reg) return { status: 'unsupported', reason: 'Service worker registration failed' };
+
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') return { status: 'denied' };
+
+  const res = await fetch('/api/push/vapid-public-key');
+  const { publicKey } = await res.json();
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !keyMatches(sub, publicKey)) {
+    try { await sub.unsubscribe(); } catch { /* ignore */ }
+    sub = null;
+  }
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      // Cast: TS's BufferSource requires Uint8Array<ArrayBuffer> (not
+      // ArrayBufferLike). Our helper already returns ArrayBuffer-backed
+      // bytes, so this is a narrowing assertion.
+      applicationServerKey: urlBase64ToUint8Array(publicKey) as unknown as BufferSource,
+    });
+  }
+
+  await registerWithServer(sub, label);
   return { status: 'subscribed', endpoint: sub.endpoint };
 }
 

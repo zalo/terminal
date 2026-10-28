@@ -52,6 +52,8 @@ import {
 import { initCanvas, registerCanvasRoutes, canvasWss } from './canvas';
 import { registerVoiceRoutes } from './voice';
 import { registerProxyRoutes, localProxyMiddleware, handleLocalWsUpgrade } from './proxy';
+import { contentRange, parseByteRange } from './range';
+import { initShare, registerShareRoutes, createShareServer } from './share';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -197,6 +199,11 @@ const ALL_CONTEXTS: Context[] = COORDINATOR_MODE && contexts
 initCanvas(ALL_CONTEXTS);
 registerCanvasRoutes(app);
 registerProxyRoutes(app);
+// Public share grants (time-limited, per-port, default off). The management
+// routes live here on the owner-only app; the public listener is started
+// alongside the main one below.
+initShare({ reservedPorts: [Number(PORT)], publicOrigin: process.env.TERMINAL_SHARE_ORIGIN });
+registerShareRoutes(app);
 registerVoiceRoutes(app, (req) => {
   const name = (req.query.context as string) || (req.body?.context as string) || '';
   if (!name) return ALL_CONTEXTS.find((c) => c.name === 'admin') || ALL_CONTEXTS[0];
@@ -538,12 +545,14 @@ if (COORDINATOR_MODE && contexts) {
     }
 
     const fileSize = st.size;
-    const range = req.headers.range;
+    const range = parseByteRange(req.headers.range, fileSize);
+    if (range === 'unsatisfiable') {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      return res.status(416).end();
+    }
     if (range) {
-      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(startStr, 10);
-      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      const { start, end } = range;
+      res.setHeader('Content-Range', contentRange(range, fileSize));
       res.setHeader('Content-Length', end - start + 1);
       res.status(206);
       const stream = ctxOpenRead(ctx, filePath, { start, end });
@@ -741,19 +750,30 @@ app.get('/api/files', (req, res) => {
     const entries = fs.readdirSync(requestedPath, { withFileTypes: true });
     const files = entries.map(entry => {
       const fullPath = path.join(requestedPath, entry.name);
-      const isDir = entry.isDirectory();
+      const symlink = entry.isSymbolicLink();
+      let isDir = entry.isDirectory();
       let size: number | null = null;
       let modified: Date = new Date();
+      let broken = false;
       try {
+        // statSync follows symlinks, so a link to a dir lists as a dir
         const stats = fs.statSync(fullPath);
+        isDir = stats.isDirectory();
         modified = stats.mtime;
         if (!isDir) size = stats.size;
-      } catch {}
+      } catch {
+        broken = symlink;
+      }
+      let target: string | undefined;
+      if (symlink) {
+        try { target = fs.readlinkSync(fullPath); } catch {}
+      }
       return {
         name: entry.name,
         type: isDir ? 'directory' : 'file',
         size,
         modified,
+        ...(symlink ? { symlink, target, ...(broken ? { broken } : {}) } : {}),
       };
     });
 
@@ -786,7 +806,7 @@ app.get('/api/files/dir-sizes', (req, res) => {
   try {
     // du -b --max-depth=1 on the directory, with a timeout
     const result = execSync(
-      `du -b --max-depth=1 ${JSON.stringify(requestedPath)} 2>/dev/null || true`,
+      `du -bD --max-depth=1 ${JSON.stringify(requestedPath)} 2>/dev/null || true`,
       { encoding: 'utf-8', timeout: 15000 }
     );
     const sizes: Record<string, number> = {};
@@ -947,16 +967,18 @@ app.get('/api/files/stream', (req, res) => {
     };
     const mimeType = mimeTypes[ext] || 'application/octet-stream';
     const fileSize = stats.size;
-    const range = req.headers.range;
+    const range = parseByteRange(req.headers.range, fileSize);
 
     res.setHeader('Content-Type', mimeType);
     res.setHeader('Accept-Ranges', 'bytes');
 
+    if (range === 'unsatisfiable') {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      return res.status(416).end();
+    }
     if (range) {
-      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(startStr, 10);
-      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      const { start, end } = range;
+      res.setHeader('Content-Range', contentRange(range, fileSize));
       res.setHeader('Content-Length', end - start + 1);
       res.status(206);
       fs.createReadStream(filePath, { start, end }).pipe(res);
@@ -1786,6 +1808,11 @@ app.use((_req, res) => {
 //     agent-* account) posts here. The terminal API is NOT mounted on it, so a
 //     local caller gets nothing else.
 //
+//  3. SHARE listener on a second Unix socket (TERMINAL_SHARE_SOCKET, default
+//     <runtime dir>/terminal-share.sock). cloudflared points a public hostname
+//     with NO Access policy at it. It serves only /lp/<port>/ for ports with a
+//     live share grant (see share.ts) — never the app, API or our websockets.
+//
 // Set TERMINAL_TCP=1 to serve the main app on TCP instead — used by dev.sh,
 // where Vite proxies to the backend over TCP.
 
@@ -1831,11 +1858,30 @@ function startNotifyListener() {
   });
 }
 
+function startShareListener() {
+  const shareServer = createShareServer();
+  const tcpPort = Number(process.env.TERMINAL_SHARE_PORT);
+  if (tcpPort > 0) {
+    shareServer.listen(tcpPort, '127.0.0.1', () => {
+      console.log(`Share listener on http://127.0.0.1:${tcpPort} (gated /lp only)`);
+    });
+    return;
+  }
+  const SHARE_SOCK = process.env.TERMINAL_SHARE_SOCKET
+    || path.join(process.env.XDG_RUNTIME_DIR || os.tmpdir(), 'terminal-share.sock');
+  try { if (fs.existsSync(SHARE_SOCK)) fs.unlinkSync(SHARE_SOCK); } catch {}
+  shareServer.listen(SHARE_SOCK, () => {
+    try { fs.chmodSync(SHARE_SOCK, 0o600); } catch {}
+    console.log(`Share listener on unix:${SHARE_SOCK} (gated /lp only; public via ${process.env.TERMINAL_SHARE_ORIGIN || 'unset origin'})`);
+  });
+}
+
 if (process.env.TERMINAL_TCP === '1') {
   const HOST = process.env.HOST || '127.0.0.1';
   server.listen(Number(PORT), HOST, () => {
     console.log(`Server running on http://${HOST}:${PORT} (TERMINAL_TCP)`);
     console.log(`Using tmux socket: ${TMUX_SOCKET || 'default'}`);
+    startShareListener();
   });
 } else {
   const SOCK = process.env.TERMINAL_SOCKET
@@ -1846,5 +1892,6 @@ if (process.env.TERMINAL_TCP === '1') {
     console.log(`Server running on unix:${SOCK} (mode 0600, ${os.userInfo().username} only)`);
     console.log(`Using tmux socket: ${TMUX_SOCKET || 'default'}`);
     startNotifyListener();
+    startShareListener();
   });
 }

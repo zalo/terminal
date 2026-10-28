@@ -1,0 +1,194 @@
+#!/bin/bash
+# terminal-gh-shim — system-wide gh wrapper for the per-context Linux users.
+#
+# Installed at /usr/local/bin/gh by scripts/contexts/gh-shim.sh. The real gh
+# (pacman package `github-cli`) stays untouched at /usr/bin/gh; /usr/local/bin
+# precedes /usr/bin on every user's PATH so this wrapper is what `gh` resolves
+# to. Package upgrades never overwrite it (Arch equivalent of the old Ubuntu
+# dpkg-divert setup, without the diversion).
+#
+# For every user EXCEPT the restricted ones this is a transparent pass-through.
+# For restricted users it adds defense-in-depth around their scoped FGPAT:
+#   - clear early errors when args reference a blocked org
+#   - blocks `gh auth` subcommands that could swap out the stored token
+#   - strips GH_TOKEN / GITHUB_TOKEN from env so the stored FGPAT is used
+# The hard security boundary remains the FGPAT itself (scoped to ALLOWED_OWNER).
+#
+# Policy lives in /etc/terminal/gh-shim.conf (root-owned, sourced below) so
+# the user list can change without reinstalling the wrapper.
+
+set -u
+
+REAL_GH=/usr/bin/gh
+CONF=/etc/terminal/gh-shim.conf
+SHIM_SRC_HINT="<terminal repo>/scripts/bin/gh (install: sudo scripts/contexts/gh-shim.sh install)"
+
+# Defaults — overridden by $CONF if present. BLOCKED_ORGS and ALLOWED_OWNER
+# are deployment-specific and intentionally empty here; set them in $CONF
+# (see scripts/contexts/gh-shim.conf.example).
+RESTRICTED_USERS=(agent-untrusted agent-john)
+BLOCKED_ORGS=()
+ALLOWED_OWNER=""
+
+if [[ -r "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+fi
+
+OWNER_LABEL="${ALLOWED_OWNER:-<ALLOWED_OWNER unset in $CONF>}"
+
+if [[ ! -x "$REAL_GH" ]]; then
+    echo "gh (terminal shim): real gh binary not found at $REAL_GH." >&2
+    echo "gh (terminal shim): install it with: sudo pacman -S github-cli" >&2
+    exit 127
+fi
+if [[ "$(readlink -f "$REAL_GH")" == "$(readlink -f "$0")" ]]; then
+    echo "gh (terminal shim): $REAL_GH resolves to this wrapper — refusing to recurse." >&2
+    exit 1
+fi
+
+CURRENT_USER="$(id -un)"
+is_restricted_user() {
+    local u
+    for u in "${RESTRICTED_USERS[@]}"; do
+        [[ "$CURRENT_USER" == "$u" ]] && return 0
+    done
+    return 1
+}
+
+print_fgpat_help() {
+    # Default target user for the rotation steps: whoever invoked the help if
+    # they are themselves a restricted user, otherwise the first in the list.
+    local target_user="${RESTRICTED_USERS[0]}"
+    if is_restricted_user; then
+        target_user="$CURRENT_USER"
+    fi
+
+    cat >&2 <<EOF
+gh shim — FGPAT rotation procedure
+
+This shim restricts these Linux users to the '${OWNER_LABEL}' GitHub account:
+  ${RESTRICTED_USERS[*]}
+Blocked org(s) (rejected on the command line before gh runs):
+  ${BLOCKED_ORGS[*]:-<none configured>}
+Each user holds its own fine-grained PAT in ~<user>/.config/gh/hosts.yml,
+so they rotate independently.
+
+1) Generate a new FGPAT at:
+     https://github.com/settings/personal-access-tokens/new
+
+   Token name:        ${target_user} shim (${OWNER_LABEL} scope)
+   Expiration:        up to 1 year
+   Resource owner:    ${OWNER_LABEL}    <- single-owner is the security boundary
+   Repository access: All repositories  (or Selected)
+
+   Repository permissions — Read and write:
+     - Contents
+     - Pull requests
+     - Issues
+     - Workflows         (only if agents touch CI)
+     - Commit statuses   (only if agents update build status)
+     - Discussions       (optional)
+   Read only:
+     - Metadata          (mandatory)
+   Account permissions: leave all at "No access"
+
+2) Provision it for ${target_user} — the shim blocks 'gh auth login' for
+   restricted users, so call ${REAL_GH} directly from the admin account:
+
+     read -rsp "Paste FGPAT: " TOK; echo
+     printf '%s' "\$TOK" | sudo -u ${target_user} ${REAL_GH} \\
+         auth login --with-token --hostname github.com
+     unset TOK
+     sudo -u ${target_user} gh auth status   # verify
+
+   To rotate for a different restricted user, replace '${target_user}' above
+   with the target username.
+
+Policy file:  ${CONF}
+Shim source:  ${SHIM_SRC_HINT}
+Real gh:      ${REAL_GH}
+EOF
+}
+
+# Self-documenting help works for any user.
+if [[ "${1:-}" == "shim-help" || "${1:-}" == "restricted-help" ]]; then
+    print_fgpat_help
+    exit 0
+fi
+
+# Transparent pass-through for every non-restricted user.
+if ! is_restricted_user; then
+    exec "$REAL_GH" "$@"
+fi
+
+deny() {
+    {
+        echo "gh-restricted: refusing — argument references blocked org '$2'"
+        echo "gh-restricted:   offending arg: $1"
+        echo "gh-restricted: ${CURRENT_USER} is scoped to the '${OWNER_LABEL}' account only."
+        echo "gh-restricted: (run 'gh shim-help' for FGPAT details if this is an auth/setup question.)"
+    } >&2
+    exit 1
+}
+
+# Block auth-mutating subcommands so the provisioned FGPAT cannot be replaced.
+if [[ "${1:-}" == "auth" ]]; then
+    case "${2:-}" in
+        login|logout|refresh|switch)
+            {
+                echo "gh-restricted: 'gh auth ${2}' is disabled for this user."
+                echo "gh-restricted: auth is provisioned via a scoped FGPAT and managed by the admin user."
+                echo "gh-restricted: run 'gh shim-help' to see the FGPAT rotation procedure."
+            } >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# Flags whose value is an org/user/repo name — check the next arg literally.
+ORG_VALUE_FLAGS=" --owner --org --user --repo -R --source-repo --target-repo --login --search "
+
+shopt -s nocasematch
+prev=""
+for arg in "$@"; do
+    for org in "${BLOCKED_ORGS[@]}"; do
+        # Repo/URL/API-path forms: owner segment is the blocked org
+        if [[ "$arg" =~ (^|/|=)${org}(/|$|\.git$) ]]; then
+            shopt -u nocasematch; deny "$arg" "$org"
+        fi
+        if [[ "$arg" =~ github\.com/${org}(/|$|\.git) ]]; then
+            shopt -u nocasematch; deny "$arg" "$org"
+        fi
+        # Search qualifiers: owner:ORG / org:ORG / user:ORG / repo:ORG/...
+        if [[ "$arg" =~ (^|[[:space:]\"\'])(owner|org|user|repo):${org}(/|$|[[:space:]\"\']) ]]; then
+            shopt -u nocasematch; deny "$arg" "$org"
+        fi
+        # Bare value after an org-context flag: e.g. `--owner ORG`
+        if [[ "$ORG_VALUE_FLAGS" == *" $prev "* ]]; then
+            if [[ "$arg" == "$org" || "$arg" == "$org"/* ]]; then
+                shopt -u nocasematch; deny "$arg" "$org"
+            fi
+        fi
+    done
+    prev="$arg"
+done
+shopt -u nocasematch
+
+# Drop externally-supplied tokens so gh falls back to the stored FGPAT.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+
+# Forward to real gh. If it fails AND a quick auth probe also fails, the
+# FGPAT is likely missing, expired, or revoked — surface the rotation hint.
+"$REAL_GH" "$@"
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+    if ! "$REAL_GH" auth status >/dev/null 2>&1; then
+        {
+            echo
+            echo "gh-restricted: auth probe failed — the FGPAT may be missing, expired, or revoked."
+            echo "gh-restricted: run 'gh shim-help' for the rotation procedure."
+        } >&2
+    fi
+fi
+exit "$rc"

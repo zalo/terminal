@@ -65,7 +65,14 @@ function saveSubs() {
 export function initPush(): void {
   vapid = loadOrCreateVapid();
   subscriptions = loadSubs();
-  const contact = process.env.VAPID_CONTACT || 'mailto:noreply@localhost';
+  // The VAPID subject is sent to the push service on every request. Apple's
+  // service rejects malformed/localhost subjects with 403 BadJwtToken, so the
+  // fallback is a syntactically valid placeholder; set VAPID_CONTACT (an
+  // https: URL or mailto:) in the service environment for real deployments.
+  const contact = process.env.VAPID_CONTACT || 'mailto:admin@example.com';
+  if (!process.env.VAPID_CONTACT) {
+    console.warn('[push] VAPID_CONTACT not set; using placeholder subject. Set it to your https:// origin or a mailto: address.');
+  }
   webpush.setVapidDetails(contact, vapid.publicKey, vapid.privateKey);
   console.log(`[push] ${subscriptions.length} subscription(s) loaded`);
 }

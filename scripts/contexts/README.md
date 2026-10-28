@@ -177,6 +177,74 @@ The script is idempotent: re-running it with a different `CONTEXTS` list
 adds any missing users without disturbing existing ones. The group/admin
 membership steps no-op when already satisfied.
 
+## GitHub CLI shim (restricted contexts)
+
+The token-scoping layer mentioned below has a companion wrapper so a
+restricted agent gets a clear, early refusal instead of a confusing 404 when
+it wanders toward an org it must not touch.
+
+Before (or right after) the first install, set the policy. The repo ships
+placeholders, not real values:
+
+| Setting | Meaning | Shipped value |
+| --- | --- | --- |
+| `RESTRICTED_USERS` | Linux users whose `gh` calls are policed | `(agent-untrusted agent-john)` |
+| `BLOCKED_ORGS` | GitHub orgs/owners restricted users must never reference | `(your-blocked-org)` (placeholder) |
+| `ALLOWED_OWNER` | The one GitHub account their FGPATs are scoped to (help/error text) | `"your-github-account"` (placeholder) |
+
+`install` copies `scripts/contexts/gh-shim.conf.example` to
+`/etc/terminal/gh-shim.conf` if that file doesn't exist yet, so either edit
+the example first or edit the `/etc` copy afterwards:
+
+```bash
+sudoedit /etc/terminal/gh-shim.conf
+# BLOCKED_ORGS=(my-employer)
+# ALLOWED_OWNER="my-github-username"
+```
+
+`install` and `status` warn while a `your-…` placeholder is still in
+place. With no `/etc` file at all, the shim's built-in defaults block no orgs.
+
+```bash
+sudo ./scripts/contexts/gh-shim.sh install     # idempotent; re-run after editing scripts/bin/gh
+     ./scripts/contexts/gh-shim.sh status      # no root; shows policy + per-user auth probe
+sudo ./scripts/contexts/gh-shim.sh uninstall   # add --purge to drop the policy file too
+```
+
+What `install` does on Arch/Omarchy:
+
+- Installs the `github-cli` package if `/usr/bin/gh` is missing. The context
+  users can't see the admin's mise-managed `gh`, so a system-wide binary is
+  required.
+- Copies `scripts/bin/gh` to `/usr/local/bin/gh`. That directory precedes
+  `/usr/bin` on every user's PATH, so `gh` resolves to the wrapper, and
+  pacman upgrades never overwrite it. (This replaces the `dpkg-divert`
+  trick the Ubuntu-era shim used.)
+- Seeds `/etc/terminal/gh-shim.conf` from `gh-shim.conf.example` if absent.
+  Edit the `/etc` copy to change the policy; it is never clobbered.
+
+Behaviour, driven by the policy file:
+
+- Users **not** in `RESTRICTED_USERS` get a transparent `exec` of the real
+  `gh`. The admin and the broad-token contexts (`agent-work`, `agent-tom`)
+  are unaffected.
+- Users in `RESTRICTED_USERS` (`agent-untrusted`, `agent-john` by default):
+  - any argument naming a `BLOCKED_ORGS` entry (repo slug, URL, `--owner`
+    value, API path, search qualifier) is refused before `gh` runs;
+  - `gh auth login|logout|refresh|switch` are refused so the provisioned
+    FGPAT can't be swapped out;
+  - `GH_TOKEN` / `GITHUB_TOKEN` are stripped so the stored FGPAT is used;
+  - if a command fails and the auth probe also fails, a rotation hint is
+    printed.
+- `gh shim-help` (any user) prints the FGPAT creation + rotation procedure.
+
+The shim is defense-in-depth only: a restricted user can still invoke
+`/usr/bin/gh` directly. The **real** boundary is the fine-grained PAT in
+that user's `~/.config/gh/hosts.yml`, scoped to a single resource owner.
+Rotate it with the recipe from `gh shim-help`; because restricted users
+can't run `gh auth login` themselves, the admin provisions it via
+`sudo -u <user> /usr/bin/gh auth login --with-token`.
+
 ## Threat model notes
 
 What this layer protects against:

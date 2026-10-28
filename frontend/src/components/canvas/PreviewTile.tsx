@@ -9,7 +9,9 @@ import { canvasStore } from '../../lib/canvas/store';
 import { isMultiTouch } from '../../lib/canvas/gesture';
 import type { RosterEntry, TileRect } from '../../lib/canvas/types';
 import { resolveFrameSrc } from '../../lib/frameSrc';
+import { openExternal } from '../../lib/openExternal';
 import { useStage } from './CanvasStage';
+import ShareButton from './ShareButton';
 
 const HEADER_H = 34;
 
@@ -102,10 +104,11 @@ export default function PreviewTile({ session, rect, selected, onSelect }: Previ
         </span>
         <span className="text-[11px] truncate" style={{ color: 'var(--cv-ink-dim)' }}>{url}</span>
         <span className="flex-1" />
+        <ShareButton url={url} headerHeight={HEADER_H} />
         <button
           className="tile-btn" title="Open in new tab"
           onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => url && window.open(url, '_blank', 'noopener')}
+          onClick={() => url && openExternal(url)}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5">
             <path d="M7 17L17 7M9 7h8v8" />

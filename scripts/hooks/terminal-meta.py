@@ -14,7 +14,10 @@ import sys
 import time
 from pathlib import Path
 
-META_DIR = Path("/tmp/claude-terminal-meta")
+# Per-context dir: the terminal server exports CLAUDE_META_DIR into each tmux
+# session it spawns (server/src/contexts.ts), so agent-* contexts write to
+# their own dir instead of the admin one.
+META_DIR = Path(os.environ.get("CLAUDE_META_DIR", "/tmp/claude-terminal-meta"))
 TASK_MAX = 160
 # Headings/meta-prefixes that make poor glance-summaries — skip them when extracting.
 BORING_PREFIXES = ("let me ", "i'll ", "i will ", "now ", "ok ", "okay ", "sure")

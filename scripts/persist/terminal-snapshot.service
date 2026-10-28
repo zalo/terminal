@@ -1,0 +1,7 @@
+[Unit]
+Description=Snapshot terminal tmux sessions (all contexts) for restore after reboot
+
+[Service]
+Type=oneshot
+ExecStart=__REPO_DIR__/scripts/persist/tm-snapshot
+Environment=CONTEXTS_CONFIG=__REPO_DIR__/config/contexts.json

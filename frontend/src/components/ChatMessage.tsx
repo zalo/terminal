@@ -1,6 +1,26 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { openExternal } from '../lib/openExternal';
+
+// Markdown links open outside the app (new tab / Chrome from the iOS PWA)
+// instead of navigating this tab away from the session.
+const markdownComponents = {
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => {
+        if (!href) return;
+        e.preventDefault();
+        openExternal(href);
+      }}
+    >
+      {children}
+    </a>
+  ),
+};
 
 interface ContentBlock {
   type: string;
@@ -232,7 +252,7 @@ export default function ChatMessage({ message, isStreaming, onQuestionResponse, 
             if (block.type === 'text' && block.text) {
               return (
                 <div key={i} className="chat-markdown text-sm text-slate-200">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
                     {block.text}
                   </ReactMarkdown>
                   {isStreaming && i === content.length - 1 && (

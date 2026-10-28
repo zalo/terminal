@@ -96,6 +96,15 @@ for u in "${ADMIN_USER:-}" "${CONTEXTS[@]}"; do
   [[ -n "$u" ]] && id "$u" >/dev/null 2>&1 && strip_notif_block_for_user "$u"
 done
 
+# 1d. remove the gh shim (see gh-shim.sh). Only touches /usr/local/bin/gh when
+#     it carries our marker; keeps /etc/terminal/gh-shim.conf and the
+#     github-cli package (run gh-shim.sh uninstall --purge for a full removal).
+GH_SHIM_DEST=/usr/local/bin/gh
+if [[ -f "$GH_SHIM_DEST" ]] && grep -qF 'terminal-gh-shim' "$GH_SHIM_DEST"; then
+  rm -f "$GH_SHIM_DEST"
+  log "removed $GH_SHIM_DEST (gh shim)"
+fi
+
 # 2. stop any peer services that earlier iterations may have installed --------
 for user in "${CONTEXTS[@]}"; do
   id "$user" >/dev/null 2>&1 || continue

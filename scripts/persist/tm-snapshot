@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""tm-snapshot: record every context's tmux sessions (and the Claude Code
+session running in each pane) so tm-restore can rebuild them after a reboot.
+
+Reads the contexts file the terminal server uses (CONTEXTS_CONFIG), walks each
+context's tmux socket (via `sudo -u <user>` for peer contexts), and matches
+panes against Claude Code's own live registry (~/.claude/sessions/<pid>.json,
+which records the tmux target of every interactive session). Writes one JSON
+document atomically to $TERMINAL_STATE_DIR/sessions.json and keeps a few
+rotated backups.
+
+Guards against recording a transient "everything is gone" state: it refuses
+to write while terminal-server.service is not active or was (re)started less
+than SETTLE_SECS ago (tm-restore runs in its ExecStartPre, so after a crash
+the sessions reappear before the guard lifts), and until tm-restore has
+written its marker this boot. The server state is checked again after
+collecting: an oomd kill can land mid-snapshot (collection slows to tens of
+seconds under memory pressure), so if the server is no longer active or its
+InvocationID changed, the result is discarded. A context that had sessions
+and now reads as empty is only recorded once a second tick, >= CONFIRM_SECS
+later under the same server invocation, agrees. Snapshots that passed these
+checks carry "vetted": true, and tm-restore ignores an unvetted empty one.
+Set TERMINAL_SNAPSHOT_FORCE=1 (or --force, as ExecStop does) to bypass.
+
+Retention: sessions.json, sessions.1..N.json (last N ticks),
+hourly/sessions-YYYYmmdd-HH.json (48 h), and sessions.last-good.json = the
+newest snapshot that contained at least one Claude session.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONTEXTS_CONFIG = os.environ.get(
+    "CONTEXTS_CONFIG", str(HOME / "Work/tries/terminal/config/contexts.json")
+)
+STATE_DIR = Path(os.environ.get("TERMINAL_STATE_DIR", HOME / ".local/state/terminal"))
+SNAPSHOT = STATE_DIR / "sessions.json"
+BACKUPS = 10
+HOURLY_KEEP = 48
+SETTLE_SECS = 120
+CONFIRM_SECS = 50  # timer ticks every ~60s
+SERVER_UNIT = os.environ.get("TERMINAL_SERVER_UNIT", "terminal-server.service")
+LAST_GOOD = STATE_DIR / "sessions.last-good.json"
+PENDING_EMPTY = STATE_DIR / "pending-empty.json"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+RESTORE_MARKER = RUNTIME_DIR / "terminal-restore.done"
+
+# Flags we drop when rebuilding a resume command (they'd fight --resume or
+# re-send an initial prompt). Value-taking flags we keep, with their argument.
+DROP_FLAGS = {"--resume", "-r", "--continue", "-c", "--session-id", "--fork-session",
+              "--teleport", "--from-pr", "-p", "--print"}
+DROP_WITH_VALUE = {"--resume", "-r", "--session-id", "--teleport", "--from-pr"}
+KEEP_WITH_VALUE = {"--model", "--permission-mode", "--add-dir", "--settings",
+                   "--mcp-config", "--agent", "--append-system-prompt",
+                   "--allowedTools", "--disallowedTools", "--fallback-model"}
+
+PANE_FMT = "|".join([
+    "#{session_name}", "#{window_id}", "#{window_index}", "#{window_name}",
+    "#{window_active}", "#{pane_id}", "#{pane_index}", "#{pane_active}",
+    "#{pane_current_path}", "#{pane_current_command}", "#{pane_pid}",
+])
+
+
+def log(msg):
+    print(f"[tm-snapshot] {msg}", file=sys.stderr)
+
+
+def load_contexts():
+    try:
+        cfg = json.loads(Path(CONTEXTS_CONFIG).read_text())
+        return cfg["contexts"]
+    except Exception as e:  # single-context fallback mirrors the server
+        log(f"no contexts file ({e}); using admin socket only")
+        return [{
+            "name": "admin", "user": None, "label": "Admin",
+            "tmuxSocket": os.environ.get("TMUX_SOCKET", "/tmp/orchestrator-tmux.sock"),
+            "metaDir": "/tmp/claude-terminal-meta", "cwd": str(HOME / "Work"),
+        }]
+
+
+def as_user(ctx, argv):
+    if ctx.get("user"):
+        return ["sudo", "-n", "-u", ctx["user"], "--", *argv]
+    return argv
+
+
+def run(argv, timeout=10):
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout
+
+
+def list_panes(ctx):
+    code, out = run(as_user(ctx, ["tmux", "-S", ctx["tmuxSocket"], "list-panes", "-a", "-F", PANE_FMT]))
+    if code != 0:
+        return []
+    panes = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) != 11:
+            continue
+        (sess, wid, widx, wname, wactive, pid_, pidx, pactive, cwd, cmd, ppid) = parts
+        panes.append({
+            "session": sess, "window_id": wid, "window_index": int(widx), "window_name": wname,
+            "window_active": wactive == "1", "pane_id": pid_, "pane_index": int(pidx),
+            "pane_active": pactive == "1", "cwd": cwd, "command": cmd, "pane_pid": int(ppid),
+        })
+    return panes
+
+
+def claude_registry(ctx):
+    """Return {tmux_target: entry} for Claude processes that are still alive."""
+    script = 'for f in "$HOME"/.claude/sessions/*.json; do [ -f "$f" ] && cat "$f" && echo; done'
+    code, out = run(as_user(ctx, ["sh", "-c", script]))
+    reg = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        pid, target = e.get("pid"), e.get("tmux")
+        if not pid or not target:
+            continue
+        # Skip stale files left by crashed/killed sessions: pid must be alive,
+        # still a claude process, and owned by the context user.
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in cmdline if a]
+        if not argv or not re.search(r"(^|/)claude$", argv[0]) and "claude" not in argv[0]:
+            continue
+        e["argv"] = argv
+        reg[target] = e
+    return reg
+
+
+def resume_flags(argv):
+    """Strip argv[0], session-selection flags and positional prompt; keep the rest."""
+    out, i, args = [], 0, argv[1:]
+    while i < len(args):
+        a = args[i]
+        if a in DROP_WITH_VALUE:
+            i += 2 if i + 1 < len(args) and not args[i + 1].startswith("-") else 1
+            continue
+        if a in DROP_FLAGS:
+            i += 1
+            continue
+        if a.startswith("-"):
+            out.append(a)
+            if a in KEEP_WITH_VALUE and i + 1 < len(args):
+                out.append(args[i + 1])
+                i += 1
+        # positional (initial prompt) is dropped
+        i += 1
+    return out
+
+
+def snapshot():
+    contexts = load_contexts()
+    doc = {"version": 1, "taken_at": int(time.time()), "host": os.uname().nodename, "contexts": []}
+    total_sessions = total_claude = 0
+    for ctx in contexts:
+        panes = list_panes(ctx)
+        if not panes:
+            doc["contexts"].append({"name": ctx["name"], "user": ctx.get("user"),
+                                    "tmuxSocket": ctx["tmuxSocket"], "sessions": []})
+            continue
+        reg = claude_registry(ctx)
+        sessions = {}
+        for p in panes:
+            s = sessions.setdefault(p["session"], {"name": p["session"], "windows": {}})
+            w = s["windows"].setdefault(p["window_id"], {
+                "index": p["window_index"], "name": p["window_name"],
+                "active": p["window_active"], "panes": []})
+            target = f'{p["session"]}:{p["window_id"]}.{p["pane_id"]}'
+            pane = {"index": p["pane_index"], "active": p["pane_active"],
+                    "cwd": p["cwd"], "command": p["command"]}
+            e = reg.get(target)
+            if e:
+                pane["claude"] = {
+                    "session_id": e.get("sessionId"), "cwd": e.get("cwd") or p["cwd"],
+                    "flags": resume_flags(e["argv"]), "name": e.get("name"),
+                    "status": e.get("status"), "version": e.get("version"),
+                }
+                total_claude += 1
+            w["panes"].append(pane)
+        out_sessions = []
+        for s in sessions.values():
+            wins = sorted(s["windows"].values(), key=lambda w: w["index"])
+            for w in wins:
+                w["panes"].sort(key=lambda p: p["index"])
+            out_sessions.append({"name": s["name"], "windows": wins})
+        total_sessions += len(out_sessions)
+        doc["contexts"].append({"name": ctx["name"], "user": ctx.get("user"),
+                                "tmuxSocket": ctx["tmuxSocket"], "metaDir": ctx.get("metaDir"),
+                                "defaultCwd": ctx.get("cwd"), "sessions": out_sessions})
+    return doc, total_sessions, total_claude
+
+
+def server_state():
+    """systemd properties of the server unit, or None if systemctl can't tell us."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", SERVER_UNIT, "-p", "ActiveState",
+                            "-p", "InvocationID", "-p", "ExecMainStartTimestampMonotonic"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+
+
+def server_settled(props):
+    """False while the terminal server is down or restarted < SETTLE_SECS ago."""
+    if props is None:
+        return True  # can't tell; don't block forever
+    if props.get("ActiveState") != "active":
+        return False
+    try:
+        started = int(props.get("ExecMainStartTimestampMonotonic", "0")) / 1e6
+    except ValueError:
+        return True
+    return (time.clock_gettime(time.CLOCK_MONOTONIC) - started) >= SETTLE_SECS
+
+
+def server_changed(before, after):
+    """True if the server went down or was replaced while we were collecting."""
+    if before is None or after is None:
+        return False
+    return after.get("ActiveState") != "active" or after.get("InvocationID") != before.get("InvocationID")
+
+
+def emptied_contexts(doc):
+    """Contexts that had sessions in the current sessions.json but have none in doc."""
+    try:
+        prev = json.loads(SNAPSHOT.read_text())
+    except Exception:
+        return []
+    had = {c["name"] for c in prev.get("contexts", []) if c.get("sessions")}
+    now = {c["name"] for c in doc["contexts"] if c.get("sessions")}
+    return sorted(had - now)
+
+
+def confirm_empty(emptied, props):
+    """Record that these contexts read as empty; True once a later tick under the
+    same server invocation, >= CONFIRM_SECS on, sees the same thing."""
+    inv = (props or {}).get("InvocationID")
+    now = int(time.time())
+    try:
+        pend = json.loads(PENDING_EMPTY.read_text())
+    except Exception:
+        pend = None
+    if pend and pend.get("contexts") == emptied and pend.get("invocation") == inv:
+        if now - pend.get("since", now) >= CONFIRM_SECS:
+            PENDING_EMPTY.unlink(missing_ok=True)
+            return True
+        return False
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_EMPTY.write_text(json.dumps({"contexts": emptied, "invocation": inv, "since": now}))
+    return False
+
+
+def write(doc, n_sessions, n_claude):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if SNAPSHOT.exists():
+        # rotate: sessions.json -> sessions.1.json -> ... -> sessions.N.json
+        for n in range(BACKUPS - 1, 0, -1):
+            src = STATE_DIR / f"sessions.{n}.json"
+            if src.exists():
+                src.replace(STATE_DIR / f"sessions.{n + 1}.json")
+        shutil.copy2(SNAPSHOT, STATE_DIR / "sessions.1.json")
+    tmp = SNAPSHOT.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=2))
+    tmp.replace(SNAPSHOT)
+    if n_claude > 0:
+        shutil.copy2(SNAPSHOT, LAST_GOOD)
+    if n_sessions > 0:
+        hourly = STATE_DIR / "hourly"
+        hourly.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H", time.localtime(doc["taken_at"]))
+        dest = hourly / f"sessions-{stamp}.json"
+        if not dest.exists():
+            shutil.copy2(SNAPSHOT, dest)
+        for old in sorted(hourly.glob("sessions-*.json"))[:-HOURLY_KEEP]:
+            old.unlink(missing_ok=True)
+
+
+def main(argv):
+    force = os.environ.get("TERMINAL_SNAPSHOT_FORCE") == "1" or "--force" in argv
+    if "--stdout" in argv:
+        doc, ns, nc = snapshot()
+        print(json.dumps(doc, indent=2))
+        return 0
+    if not force and not RESTORE_MARKER.exists():
+        log(f"restore has not run this boot ({RESTORE_MARKER} missing); not overwriting snapshot")
+        return 0
+    before = server_state()
+    if not force and not server_settled(before):
+        log(f"{SERVER_UNIT} is down or restarted <{SETTLE_SECS}s ago; not overwriting snapshot")
+        return 0
+    doc, ns, nc = snapshot()
+    if not force:
+        after = server_state()
+        if server_changed(before, after):
+            log(f"{SERVER_UNIT} went down or restarted during the snapshot; discarding it ({ns} tmux session(s) seen)")
+            return 0
+        emptied = emptied_contexts(doc)
+        if emptied and not confirm_empty(emptied, after):
+            log(f"context(s) {', '.join(emptied)} now read as empty; waiting for the next tick to confirm before overwriting")
+            return 0
+        if not emptied:
+            PENDING_EMPTY.unlink(missing_ok=True)
+    doc["vetted"] = True
+    write(doc, ns, nc)
+    log(f"wrote {SNAPSHOT}: {ns} tmux session(s), {nc} claude session(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
