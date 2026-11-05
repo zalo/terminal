@@ -260,11 +260,22 @@ hostname with no login in front of it:
 - **Time-limited**: every grant has an absolute expiry (default 60 min, max
   `SHARE_MAX_MINUTES`, default 1440). Expired grants are swept and any live
   websocket through them is cut.
-- **Owner-only control**: grants are created from the main app (globe button
-  on browser/preview tiles that point at localhost) or with
-  `scripts/bin/tm-share <port> [--minutes N]` over the admin socket.
+- **Owner-only to grant**: grants are created from the main app or with
+  `tm-share <port> [--minutes N]` as the user that runs the server.
+- **Requests from other accounts**: any local account can file a *request*
+  over the loopback listener (`tm-share <port> --label "what" --wait` from an
+  agent account). Nothing is exposed until the owner approves it. The
+  requesting account is derived from who owns the listening socket, not from
+  what the caller claims.
 
-The server starts a second listener for this, `TERMINAL_SHARE_SOCKET`
+The **Ports & shares** panel on the sessions screen lists pending requests
+(approve for the requested time, 1 h, 8 h, or deny), then every listening
+port grouped by account with its service name, the systemd unit behind it,
+any cloudflared tunnel hostnames publishing it, the private `/lp/<port>/`
+link, and the public share state (time left, stop). Click a name to label
+the port; labels also come from `tm-share name <port> "label"`.
+
+The server starts a second listener for the public side, `TERMINAL_SHARE_SOCKET`
 (default `$XDG_RUNTIME_DIR/terminal-share.sock`; `TERMINAL_SHARE_PORT` for a
 TCP port in dev). It mounts nothing but the gated proxy. Point a separate
 tunnel hostname at it and set `TERMINAL_SHARE_ORIGIN` to that public origin,
@@ -275,7 +286,9 @@ e.g. in cloudflared's ingress:
     service: unix:/run/user/1000/terminal-share.sock
 ```
 
-Grants persist in `config/shares.json` across server restarts.
+Grants, requests and labels persist in `config/share-state.json`.
+`scripts/contexts/ensure-claude-blocks.sh` writes a managed CLAUDE.md block
+telling Claude Code sessions on every account how to use `tm-share`.
 
 ## Tech Stack
 

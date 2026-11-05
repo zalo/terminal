@@ -53,7 +53,7 @@ import { initCanvas, registerCanvasRoutes, canvasWss } from './canvas';
 import { registerVoiceRoutes } from './voice';
 import { registerProxyRoutes, localProxyMiddleware, handleLocalWsUpgrade } from './proxy';
 import { contentRange, parseByteRange } from './range';
-import { initShare, registerShareRoutes, createShareServer } from './share';
+import { initShare, registerShareRoutes, registerShareRequestRoutes, createShareServer } from './share';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -202,7 +202,7 @@ registerProxyRoutes(app);
 // Public share grants (time-limited, per-port, default off). The management
 // routes live here on the owner-only app; the public listener is started
 // alongside the main one below.
-initShare({ reservedPorts: [Number(PORT)], publicOrigin: process.env.TERMINAL_SHARE_ORIGIN });
+initShare({ reservedPorts: [Number(PORT)], publicOrigin: process.env.TERMINAL_SHARE_ORIGIN, contexts: contexts?.contexts ?? [] });
 registerShareRoutes(app);
 registerVoiceRoutes(app, (req) => {
   const name = (req.query.context as string) || (req.body?.context as string) || '';
@@ -1803,8 +1803,9 @@ app.use((_req, res) => {
 //     local account (agent-*) and nothing on the network can open the socket.
 //     There is no TCP port for the terminal API; the OS enforces the boundary.
 //
-//  2. NOTIFY-only listener on TCP 127.0.0.1:<PORT>, exposing solely
-//     POST /api/notify. Local automation running as any user (tm-notify from an
+//  2. NOTIFY listener on TCP 127.0.0.1:<PORT>, exposing POST /api/notify and
+//     the share-REQUEST routes (file/poll/cancel a request; never grant).
+//     Local automation running as any user (tm-notify / tm-share from an
 //     agent-* account) posts here. The terminal API is NOT mounted on it, so a
 //     local caller gets nothing else.
 //
@@ -1850,7 +1851,10 @@ function startNotifyListener() {
     }
   });
 
-  // 404 everything else — this listener is unmistakably notify-only.
+  // Share REQUESTS (not grants) from any local account — see share.ts.
+  registerShareRequestRoutes(notifyApp);
+
+  // 404 everything else — this listener is notify + share-request only.
   notifyApp.use((_req, res) => res.status(404).json({ error: 'not found' }));
 
   http.createServer(notifyApp).listen(Number(PORT), '127.0.0.1', () => {

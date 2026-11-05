@@ -2,36 +2,49 @@
 """tm-share: make a local port publicly reachable for a limited time.
 
 The terminal server's share listener exposes /lp/<port>/ on a public
-hostname (TERMINAL_SHARE_ORIGIN, e.g. https://share.example.com) with no
-login in front of it — but only for ports with a live grant. Grants are off
-by default and always expire.
+hostname (e.g. https://share.example.com) with no login in front of it, but
+only for ports with a live grant. Grants are off by default and always
+expire.
 
-Usage:
-  tm-share <port> [--minutes N] [--label TEXT]   share (or renew) a port
-  tm-share ls                                    list active shares
-  tm-share off <port>                            stop sharing a port
+Two modes, chosen automatically:
 
-Talks to the owner-only admin socket ($TERMINAL_SOCKET, default
-$XDG_RUNTIME_DIR/terminal-server.sock), so it only works as the user that
-runs terminal-server.
+  admin   (the user that runs terminal-server; owner socket reachable)
+          tm-share <port> [--minutes N] [--label TEXT]  share / renew now
+  request (any other local account; loopback request API)
+          tm-share <port> [--minutes N] [--label TEXT] [--wait]
+          files a request the owner approves from the Terminal UI's
+          "Ports & shares" panel; --wait blocks until it is decided
+          (default 10 min, --timeout to change) and prints the public URL.
+
+Common:
+  tm-share ls                     active public shares (admin: all; else public list)
+  tm-share status <port>          state of the request/share for a port
+  tm-share off <port>             admin: stop sharing; request mode: cancel request
+  tm-share name <port> <label>    label a port in the Ports & shares panel
+
+Env: TERMINAL_SOCKET (admin socket), TERMINAL_PORT (loopback, default 3000).
 """
 import argparse
 import http.client
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 
 
 def sock_path() -> str:
     return os.environ.get("TERMINAL_SOCKET") or os.path.join(
-        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "terminal-server.sock")
+        os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "terminal-server.sock")
+
+
+LOOPBACK_PORT = int(os.environ.get("TERMINAL_PORT", "3000"))
 
 
 class UnixConn(http.client.HTTPConnection):
     def __init__(self, path: str):
-        super().__init__("terminal-server", timeout=10)
+        super().__init__("terminal-server", timeout=15)
         self._path = path
 
     def connect(self):
@@ -41,8 +54,22 @@ class UnixConn(http.client.HTTPConnection):
         self.sock = s
 
 
-def call(method: str, path: str, body=None):
-    conn = UnixConn(sock_path())
+def admin_available() -> bool:
+    p = sock_path()
+    if not os.path.exists(p):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(p)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def call(admin: bool, method: str, path: str, body=None, ok404=False):
+    conn = UnixConn(sock_path()) if admin else http.client.HTTPConnection("127.0.0.1", LOOPBACK_PORT, timeout=15)
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
     try:
@@ -50,19 +77,24 @@ def call(method: str, path: str, body=None):
         resp = conn.getresponse()
         payload = resp.read().decode("utf-8", "replace")
     except (OSError, http.client.HTTPException) as e:
-        sys.stderr.write(f"tm-share: cannot reach terminal-server at {sock_path()}: {e}\n")
+        where = sock_path() if admin else f"127.0.0.1:{LOOPBACK_PORT}"
+        sys.stderr.write(f"tm-share: cannot reach terminal-server at {where}: {e}\n")
         sys.exit(1)
     try:
         parsed = json.loads(payload) if payload else {}
     except json.JSONDecodeError:
         parsed = {"error": payload.strip()}
+    if resp.status == 404 and ok404:
+        return None
     if resp.status >= 400:
         sys.stderr.write(f"tm-share: HTTP {resp.status}: {parsed.get('error', payload.strip())}\n")
         sys.exit(1)
     return parsed
 
 
-def fmt_remaining(expires_ms: int) -> str:
+def fmt_remaining(expires_ms) -> str:
+    if not expires_ms:
+        return "?"
     m = max(0, int((expires_ms - time.time() * 1000) / 60000 + 0.999))
     if m < 60:
         return f"{m}m"
@@ -72,46 +104,113 @@ def fmt_remaining(expires_ms: int) -> str:
 
 def print_share(s: dict):
     url = s.get("url") or f"/lp/{s['port']}/"
-    label = f"  ({s['label']})" if s.get("label") else ""
-    print(f"{url}  port {s['port']}  expires in {fmt_remaining(s['expiresAt'])}{label}")
+    extra = "".join(f"  ({s[k]})" for k in ("label", "owner") if s.get(k))
+    print(f"{url}  port {s['port']}  expires in {fmt_remaining(s.get('expiresAt'))}{extra}")
+
+
+def tmux_session():
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        return subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True, text=True, timeout=2).stdout.strip() or None
+    except Exception:
+        return None
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="tm-share", description=__doc__.split("\n\n")[0])
-    ap.add_argument("target", help="port number, 'ls', or 'off'")
-    ap.add_argument("port", nargs="?", help="port (with 'off')")
+    ap = argparse.ArgumentParser(prog="tm-share", description="Share a local port publicly for a limited time (or request that it be shared).")
+    ap.add_argument("target", help="port number, or: ls | status | off | name")
+    ap.add_argument("rest", nargs="*", help="port (and label for 'name')")
     ap.add_argument("--minutes", type=float, default=None, help="how long the port stays public (default: server default, usually 60)")
-    ap.add_argument("--label", default=None, help="note shown in listings")
+    ap.add_argument("--label", default=None, help="name shown in the Ports & shares panel")
+    ap.add_argument("--wait", action="store_true", help="request mode: wait for the owner's decision")
+    ap.add_argument("--timeout", type=int, default=600, help="seconds to wait with --wait (default 600)")
     args = ap.parse_args()
 
+    admin = admin_available()
+
     if args.target == "ls":
-        state = call("GET", "/api/share")
+        state = call(admin, "GET", "/api/share" if admin else "/api/share/list")
         shares = state.get("shares", [])
         if not shares:
-            print("no active shares")
+            print("no active public shares")
             return 0
         for s in shares:
             print_share(s)
         return 0
 
-    if args.target == "off":
-        if not args.port:
-            ap.error("off needs a port")
-        r = call("DELETE", f"/api/share/{int(args.port)}")
-        print("stopped" if r.get("revoked") else "was not shared")
+    if args.target in ("status", "off", "name"):
+        if not args.rest:
+            ap.error(f"{args.target} needs a port")
+        port = int(args.rest[0])
+        if args.target == "name":
+            label = " ".join(args.rest[1:]).strip()
+            if not label:
+                ap.error("name needs a label")
+            r = call(admin, "PUT" if admin else "POST", f"/api/ports/{port}/label" if admin else "/api/ports/label",
+                     {"label": label} if admin else {"port": port, "label": label})
+            print(f"port {r['port']} labelled {r['label']!r}")
+            return 0
+        if args.target == "status":
+            shares = call(admin, "GET", "/api/share" if admin else "/api/share/list").get("shares", [])
+            live = [s for s in shares if s["port"] == port]
+            if live:
+                print("public:", end=" "); print_share(live[0])
+            req = call(False, "GET", f"/api/share/requests?port={port}", ok404=True)
+            if req:
+                print(f"request {req['id']}: {req['status']}" + (f"  {req['url']}" if req.get("url") else ""))
+            if not live and not req:
+                print(f"port {port}: not shared, no request")
+            return 0
+        # off
+        if admin:
+            r = call(True, "DELETE", f"/api/share/{port}")
+            print("stopped" if r.get("revoked") else "was not shared")
+            return 0
+        req = call(False, "GET", f"/api/share/requests?port={port}", ok404=True)
+        if req and req["status"] == "pending":
+            call(False, "DELETE", f"/api/share/requests/{req['id']}")
+            print("request cancelled")
+        else:
+            print("no pending request for that port (only the owner can stop a live share)")
         return 0
 
     try:
         port = int(args.target)
     except ValueError:
-        ap.error("first argument must be a port number, 'ls' or 'off'")
+        ap.error("first argument must be a port number, ls, status, off or name")
+
     body = {"port": port}
     if args.minutes is not None:
         body["minutes"] = args.minutes
     if args.label:
         body["label"] = args.label
-    print_share(call("POST", "/api/share", body))
-    return 0
+
+    if admin:
+        print_share(call(True, "POST", "/api/share", body))
+        return 0
+
+    body["session"] = tmux_session()
+    req = call(False, "POST", "/api/share/requests", body)
+    print(f"share request filed for port {port} ({req['minutes']:g} min); the owner approves it from the Terminal UI's Ports & shares panel.")
+    if req.get("listening") is False:
+        print(f"note: nothing is listening on port {port} right now")
+    if not args.wait:
+        print(f"check with: tm-share status {port}")
+        return 0
+
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        time.sleep(3)
+        cur = call(False, "GET", f"/api/share/requests/{req['id']}")
+        if cur["status"] == "approved":
+            print(f"approved: {cur['url']}  (expires in {fmt_remaining(cur.get('expiresAt'))})")
+            return 0
+        if cur["status"] != "pending":
+            print(f"request {cur['status']}")
+            return 1
+    print("still pending; gave up waiting (the request stays open — check later with: tm-share status)")
+    return 2
 
 
 if __name__ == "__main__":

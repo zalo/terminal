@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import NotificationToggle from './NotificationToggle';
 import HomeTabs from './HomeTabs';
+import PortsPanel from './PortsPanel';
 
 interface SessionMeta {
   status?: 'working' | 'waiting' | 'finished' | 'idle';
@@ -140,7 +141,7 @@ export default function SessionList({ onSelectSession, onSwitchView }: SessionLi
 
   return (
     <div className="h-dvh bg-[#1a1a2e] flex flex-col items-center">
-      <div className="w-full max-w-md flex flex-col flex-1 min-h-0 p-4">
+      <div className="w-full max-w-3xl flex flex-col flex-1 min-h-0 p-4 sm:px-6">
         {onSwitchView && (
           <div className="flex justify-center mt-4 -mb-2">
             <HomeTabs current="list" onSwitch={onSwitchView} />
@@ -249,6 +250,7 @@ export default function SessionList({ onSelectSession, onSwitchView }: SessionLi
               )}
             </div>
           )}
+          <PortsPanel />
         </div>
 
         <div className="mt-6 flex-shrink-0">

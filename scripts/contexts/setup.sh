@@ -203,88 +203,19 @@ fi
 # BEGIN/END markers so re-running this script is a no-op when the block is
 # already present, and revert.sh can strip it cleanly.
 
-TM_NOTIFY_SRC="$REPO_DIR/scripts/bin/tm-notify"
-TM_NOTIFY_DEST=/usr/local/bin/tm-notify
-if [[ -f "$TM_NOTIFY_SRC" ]]; then
-  install -m 0755 -o root -g root "$TM_NOTIFY_SRC" "$TM_NOTIFY_DEST"
-  log "installed $TM_NOTIFY_DEST"
-else
-  warn "$TM_NOTIFY_SRC missing; skipping system-wide install"
-fi
-
-NOTIF_BEGIN='<!-- BEGIN: terminal-notifications (managed by scripts/contexts/setup.sh) -->'
-NOTIF_END='<!-- END: terminal-notifications -->'
-NOTIF_BODY="$NOTIF_BEGIN
-## Notifications
-
-This machine has \`tm-notify\` at \`/usr/local/bin/tm-notify\`. It sends a push
-notification to the user's subscribed device(s) (typically their phone) via
-the local terminal-server. Use it to alert the user when:
-
-- A long-running task (build, test suite, large operation) finishes —
-  successfully or with an error.
-- You hit a question that blocks progress and they may not be watching the
-  screen.
-- A background process the user expects to be monitoring changes state
-  meaningfully (deploy done, dev server up, long-running script crashed).
-
-Skip for: routine actions, short ops, every step of normal work — the
-user can read the terminal.
-
-Usage:
-
-\`\`\`bash
-tm-notify \"Build done\"
-tm-notify \"Tests passed\" \"All 234 green\"
-tm-notify \"Heads up\" \"Long task complete\" --tag long-task
-tm-notify \"Needs input\" \"Question pending\" --url /?session=my-session
-\`\`\`
-
-Flags: \`--tag\` (notifications sharing a tag replace one another — use a
-stable tag for anything that fires repeatedly), \`--url\` (where to navigate
-when the notification is tapped, defaults to \`/\`), \`--icon\` (override icon).
-
-The endpoint is loopback-only — works from any shell on this machine.
-$NOTIF_END"
-
-ensure_notif_block_for_user() {
-  local u="$1"
-  local home
-  home="$(getent passwd "$u" | cut -d: -f6)"
-  if [[ -z "$home" || ! -d "$home" ]]; then
-    warn "no home dir for $u; skipping CLAUDE.md notification block"
-    return
-  fi
-  local cdir="$home/.claude"
-  local cfile="$cdir/CLAUDE.md"
-
-  # Create ~/.claude if absent, owned by the user.
-  if [[ ! -d "$cdir" ]]; then
-    install -d -o "$u" -g "$u" -m 0750 "$cdir"
-  fi
-
-  if [[ -f "$cfile" ]] && grep -qF "$NOTIF_BEGIN" "$cfile"; then
-    log "CLAUDE.md for $u already has notifications block"
-    return
-  fi
-
-  # Append (or create) with a leading blank line separator.
-  if [[ -s "$cfile" ]]; then
-    {
-      printf '\n\n'
-      printf '%s\n' "$NOTIF_BODY"
-    } >> "$cfile"
+for tool in tm-notify tm-share; do
+  src="$REPO_DIR/scripts/bin/$tool"
+  if [[ -f "$src" ]]; then
+    install -m 0755 -o root -g root "$src" "/usr/local/bin/$tool"
+    log "installed /usr/local/bin/$tool"
   else
-    printf '%s\n' "$NOTIF_BODY" > "$cfile"
+    warn "$src missing; skipping system-wide install"
   fi
-  chown "$u":"$u" "$cfile"
-  chmod 0640 "$cfile"
-  log "wrote notifications block to $cfile"
-}
-
-for u in "$ADMIN_USER" "${CONTEXTS[@]}"; do
-  ensure_notif_block_for_user "$u"
 done
+
+# Managed CLAUDE.md blocks (notifications + sharing) for every account.
+# Kept in a standalone script so it can be re-run on its own.
+bash "$REPO_DIR/scripts/contexts/ensure-claude-blocks.sh" "$ADMIN_USER" "${CONTEXTS[@]}"
 
 # 8. daemon-reload + restart terminal-server for the admin user ---------------
 ADMIN_UID="$(id -u "$ADMIN_USER")"
